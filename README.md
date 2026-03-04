@@ -24,7 +24,7 @@ LENS-PLUS is a WebRTC prototype that streams video from a phone or desktop brows
 
 - `web/` frontend app
 - `api/` backend signaling service
-- `scripts/setup-dev-https.sh` local HTTPS helper for phone camera testing
+- `scripts/setup-dev-https.sh` and `scripts/setup-dev-https.ps1` local HTTPS helpers for phone camera testing
 - `docker-compose.yml` shared dev setup
 
 ## Prerequisites
@@ -108,10 +108,18 @@ Fast path (auto setup):
 scripts/setup-dev-https.sh
 ```
 
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\setup-dev-https.ps1
+```
+
 If IP auto-detect fails:
 
 ```bash
 scripts/setup-dev-https.sh 192.168.1.42
+```
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\setup-dev-https.ps1 -LanIp 192.168.1.42
 ```
 
 The script:
