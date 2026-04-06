@@ -4,6 +4,9 @@ services:
       context: ./api
     ports:
       - "8000:8000"
+    environment:
+      - SNAPSHOT_INTERVAL_SECONDS=${SNAPSHOT_INTERVAL_SECONDS:-0.1}
+      - SNAPSHOT_JPEG_QUALITY=${SNAPSHOT_JPEG_QUALITY:-92}
     volumes:
       - ./api/app:/app/app
     healthcheck:

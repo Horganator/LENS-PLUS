@@ -8,9 +8,46 @@ KEY_FILE="$CERT_DIR/dev-key.pem"
 CERT_FILE="$CERT_DIR/dev-cert.pem"
 ENV_FILE="$ROOT_DIR/.env"
 
-if ! command -v mkcert >/dev/null 2>&1; then
+find_mkcert() {
+  if command -v mkcert >/dev/null 2>&1; then
+    command -v mkcert
+    return 0
+  fi
+
+  # Common Windows installs when running from Git Bash/Cygwin/WSL.
+  local candidate=""
+  for candidate in \
+    "/c/ProgramData/chocolatey/bin/mkcert.exe" \
+    "/mnt/c/ProgramData/chocolatey/bin/mkcert.exe" \
+    "/cygdrive/c/ProgramData/chocolatey/bin/mkcert.exe"
+  do
+    if [ -f "$candidate" ]; then
+      printf "%s" "$candidate"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+MKCERT_BIN="$(find_mkcert || true)"
+if [ -z "$MKCERT_BIN" ]; then
   printf "mkcert is required but not installed.\n"
-  printf "Install on macOS with: brew install mkcert\n"
+  case "$(uname -s)" in
+    Darwin)
+      printf "Install on macOS with: brew install mkcert\n"
+      ;;
+    Linux)
+      printf "Install on Linux from: https://github.com/FiloSottile/mkcert#installation\n"
+      ;;
+    MINGW*|MSYS*|CYGWIN*)
+      printf "Install on Windows with: winget install FiloSottile.mkcert\n"
+      printf "or with Chocolatey: choco install mkcert\n"
+      ;;
+    *)
+      printf "Install from: https://github.com/FiloSottile/mkcert#installation\n"
+      ;;
+  esac
   exit 1
 fi
 
@@ -32,13 +69,25 @@ fi
 
 mkdir -p "$CERT_DIR"
 
+KEY_FILE_ARG="$KEY_FILE"
+CERT_FILE_ARG="$CERT_FILE"
+if [[ "$MKCERT_BIN" == *.exe ]]; then
+  if command -v wslpath >/dev/null 2>&1; then
+    KEY_FILE_ARG="$(wslpath -w "$KEY_FILE")"
+    CERT_FILE_ARG="$(wslpath -w "$CERT_FILE")"
+  elif command -v cygpath >/dev/null 2>&1; then
+    KEY_FILE_ARG="$(cygpath -w "$KEY_FILE")"
+    CERT_FILE_ARG="$(cygpath -w "$CERT_FILE")"
+  fi
+fi
+
 printf "Installing local CA (mkcert -install)...\n"
-mkcert -install
+"$MKCERT_BIN" -install
 
 printf "Generating cert for localhost + %s...\n" "$LAN_IP"
-mkcert \
-  -key-file "$KEY_FILE" \
-  -cert-file "$CERT_FILE" \
+"$MKCERT_BIN" \
+  -key-file "$KEY_FILE_ARG" \
+  -cert-file "$CERT_FILE_ARG" \
   localhost 127.0.0.1 ::1 "$LAN_IP"
 
 python3 - "$ENV_FILE" <<'PY'
@@ -78,9 +127,9 @@ env_path.write_text("\n".join(lines) + "\n")
 PY
 
 printf "\nHTTPS dev setup complete.\n"
-printf "- Cert: %s\n" "$CERT_FILE"
-printf "- Key:  %s\n" "$KEY_FILE"
-printf "- LAN URL: https://%s:5173\n" "$LAN_IP"
+printf -- "- Cert: %s\n" "$CERT_FILE"
+printf -- "- Key:  %s\n" "$KEY_FILE"
+printf -- "- LAN URL: https://%s:5173\n" "$LAN_IP"
 printf "\nNext steps:\n"
 printf "1) docker compose down\n"
 printf "2) docker compose up --build\n"

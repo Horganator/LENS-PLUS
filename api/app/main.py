@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import os
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -66,6 +67,30 @@ app.add_middleware(
 )
 
 sessions: dict[str, Session] = {}
+
+
+def read_float_env(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
+def read_int_env(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+SNAPSHOT_INTERVAL_SECONDS = max(0.03, read_float_env("SNAPSHOT_INTERVAL_SECONDS", 0.1))
+SNAPSHOT_JPEG_QUALITY = min(95, max(60, read_int_env("SNAPSHOT_JPEG_QUALITY", 92)))
 
 
 @app.on_event("startup")
@@ -157,8 +182,10 @@ async def offer(payload: OfferRequest) -> OfferResponse:
                     session.last_frame_at = now
                     session.updated_at = now
 
-                    if (now - last_snapshot_at).total_seconds() >= 0.5:
-                        snapshot, snapshot_error = frame_to_jpeg(frame)
+                    if (now - last_snapshot_at).total_seconds() >= SNAPSHOT_INTERVAL_SECONDS:
+                        snapshot, snapshot_error = frame_to_jpeg(
+                            frame, jpeg_quality=SNAPSHOT_JPEG_QUALITY
+                        )
                         if snapshot:
                             session.latest_jpeg = snapshot
                             session.latest_jpeg_at = now
@@ -306,13 +333,15 @@ async def wait_for_ice_gathering(
         return
 
 
-def frame_to_jpeg(frame: Any) -> tuple[bytes | None, str | None]:
+def frame_to_jpeg(
+    frame: Any, jpeg_quality: int = SNAPSHOT_JPEG_QUALITY
+) -> tuple[bytes | None, str | None]:
     errors: list[str] = []
 
     try:
         image = frame.to_image()
         buffer = io.BytesIO()
-        image.save(buffer, format="JPEG", quality=75)
+        image.save(buffer, format="JPEG", quality=jpeg_quality)
         return buffer.getvalue(), None
     except Exception as error:
         errors.append(f"to_image failed: {error}")
@@ -321,7 +350,7 @@ def frame_to_jpeg(frame: Any) -> tuple[bytes | None, str | None]:
         rgb = frame.to_ndarray(format="rgb24")
         image = Image.fromarray(rgb)
         buffer = io.BytesIO()
-        image.save(buffer, format="JPEG", quality=75)
+        image.save(buffer, format="JPEG", quality=jpeg_quality)
         return buffer.getvalue(), None
     except Exception as error:
         errors.append(f"rgb24 fallback failed: {error}")
@@ -330,7 +359,7 @@ def frame_to_jpeg(frame: Any) -> tuple[bytes | None, str | None]:
         gray = frame.to_ndarray(format="gray")
         image = Image.fromarray(gray, mode="L")
         buffer = io.BytesIO()
-        image.save(buffer, format="JPEG", quality=75)
+        image.save(buffer, format="JPEG", quality=jpeg_quality)
         return buffer.getvalue(), None
     except Exception as error:
         errors.append(f"gray fallback failed: {error}")
