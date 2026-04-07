@@ -142,6 +142,70 @@ select {
   gap: 0.6rem;
 }
 
+.button-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+}
+
+.panel-copy {
+  color: var(--text-muted);
+}
+
+.voice-panel {
+  align-content: start;
+}
+
+.voice-preview-stage {
+  min-height: 240px;
+}
+
+#voice-preview {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  display: block;
+  object-fit: contain;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-3);
+}
+
+.voice-preview-placeholder {
+  min-height: 240px;
+  border: 1px dashed var(--border-strong);
+  border-radius: 8px;
+  background:
+    linear-gradient(180deg, var(--surface-2), var(--surface-3));
+  color: var(--text-muted);
+  display: grid;
+  align-content: center;
+  justify-items: start;
+  gap: 0.45rem;
+  padding: 1rem 1.1rem;
+  text-align: left;
+}
+
+.voice-preview-placeholder strong {
+  color: var(--text-primary);
+  font-size: 0.9rem;
+}
+
+.voice-preview-placeholder span {
+  max-width: 32rem;
+  line-height: 1.45;
+}
+
+.answer-output {
+  min-height: 5.5rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-2);
+  padding: 0.85rem;
+  line-height: 1.5;
+  color: var(--text-primary);
+  white-space: pre-wrap;
+}
+
 .page-top {
   display: flex;
 }
