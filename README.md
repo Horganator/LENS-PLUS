@@ -36,6 +36,8 @@ LENS-PLUS is a WebRTC prototype that streams video from a phone or desktop brows
 - Python 3.11+ and `pip` (for local backend workflow)
 - Node.js 18+ and npm (for local frontend workflow)
 - `mkcert` (optional, but recommended for real phone camera testing)
+- `ffmpeg` for local audio conversion and MP3 encoding
+- A local Vosk model directory for offline speech recognition
 
 ## Environment file
 
@@ -50,6 +52,7 @@ Default `.env.example`:
 ```bash
 VITE_SIGNALING_BASE_URL=http://localhost:8000
 ANALYSIS_TARGET_FPS=5
+ENABLE_MOCK_RESULTS=false
 ```
 
 `ANALYSIS_TARGET_FPS` controls server-side processing cadence and is clamped to `1..30`.
@@ -59,7 +62,16 @@ Optional backend env var:
 - `SESSION_ARTIFACTS_DIR` (default: `api/app/session_artifacts` in local dev and `/app/app/session_artifacts` in Docker)
   - Directory where per-session processed frame dumps and manifest files are written.
 
+`ANALYSIS_TARGET_FPS` controls server-side processing cadence and is clamped to `1..30`.
+
+Optional backend env var:
+
+- `SESSION_ARTIFACTS_DIR` (default: `api/app/session_artifacts` in local dev and `/app/app/session_artifacts` in Docker)
+  - Directory where per-session processed frame dumps and manifest files are written.
+
 For HTTPS + Docker phone testing, use `/api` for signaling and set `VITE_API_PROXY_TARGET=http://api:8000` (the helper script below configures this automatically).
+
+`ENABLE_MOCK_RESULTS=false` disables the old fake once-per-second guidance stream. Set it to `true` only if you want the original scaffolded mock detections back.
 
 ## Quick start (Docker)
 
@@ -91,6 +103,20 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+Set your Vosk model path before starting the API if you do not place the model at `api/models/vosk-model`:
+
+```bash
+export VOSK_MODEL_PATH=/absolute/path/to/vosk-model-small-en-us-0.15
+```
+
+Optional SmolVLM settings:
+
+```bash
+export SMOLVLM_MODEL_ID=HuggingFaceTB/SmolVLM-256M-Instruct
+export SMOLVLM_MAX_NEW_TOKENS=120
+export SMOLVLM_NUM_BEAMS=1
 ```
 
 ### Frontend
@@ -247,3 +273,31 @@ You can also pass a custom artifact path:
 ```bash
 scripts/clean-session-artifacts.sh /tmp/lens-plus-artifacts
 ```
+
+## Debugging SmolVLM
+
+You can test the SmolVLM backend integration directly without recording audio.
+
+Test with a tiny generated image:
+
+```bash
+curl -X POST http://localhost:8000/debug/vision \
+  -H "Content-Type: application/json" \
+  -d '{"use_test_image": true, "question": "What is in this image?"}'
+```
+
+Test with the latest live snapshot from an active session:
+
+```bash
+curl -X POST http://localhost:8000/debug/vision \
+  -H "Content-Type: application/json" \
+  -d '{"session_id": "YOUR_SESSION_ID", "question": "What is in this image?"}'
+```
+
+## Audio question flow
+
+- Start a source and connect.
+- Click `Record Question`, speak, then click `Stop And Send`.
+- The frontend sends the recorded audio over the existing WebRTC data channel as `question_audio`.
+- The backend converts the audio for Vosk, transcribes it offline, queries SmolVLM with the latest frame, and returns `answer`, `transcript`, and `audio_base64`.
+- The frontend displays the answer text and plays the returned MP3.

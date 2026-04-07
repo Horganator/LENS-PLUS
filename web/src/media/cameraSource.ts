@@ -31,7 +31,7 @@ export async function startCameraStream(targetFramerate = 15): Promise<MediaStre
   }
 
   return navigator.mediaDevices.getUserMedia({
-    audio: false,
+    audio: true,
     video: videoConstraints
   });
 }

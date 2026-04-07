@@ -9,6 +9,7 @@ export class WebRtcClient {
   private videoSender: RTCRtpSender | null = null;
   private sessionId: string | null = null;
   private pendingIceCandidates: RTCIceCandidate[] = [];
+  private dataChannel: RTCDataChannel | null = null;
   private connectionStateHandler: ConnectionStateHandler;
   private dataMessageHandler: DataMessageHandler;
   private logHandler: LogHandler;
@@ -38,6 +39,7 @@ export class WebRtcClient {
     this.pendingIceCandidates = [];
 
     const channel = peerConnection.createDataChannel("results");
+    this.dataChannel = channel;
     channel.onopen = () => this.logHandler("Data channel open");
     channel.onclose = () => this.logHandler("Data channel closed");
     channel.onmessage = (event) => this.dataMessageHandler(String(event.data));
@@ -126,6 +128,18 @@ export class WebRtcClient {
     }
   }
 
+  isReadyToSend(): boolean {
+    return this.dataChannel?.readyState === "open";
+  }
+
+  sendJson(payload: Record<string, unknown>): void {
+    if (!this.dataChannel || this.dataChannel.readyState !== "open") {
+      throw new Error("Data channel is not open");
+    }
+
+    this.dataChannel.send(JSON.stringify(payload));
+  }
+
   private async sendIce(candidate: RTCIceCandidate): Promise<void> {
     if (!this.sessionId) {
       return;
@@ -148,6 +162,7 @@ export class WebRtcClient {
       this.peerConnection = null;
     }
     this.videoSender = null;
+    this.dataChannel = null;
     this.sessionId = null;
     this.pendingIceCandidates = [];
     this.connectionStateHandler("closed");

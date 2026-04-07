@@ -1,4 +1,9 @@
 fastapi==0.115.5
 uvicorn[standard]==0.32.0
 aiortc==1.9.0
-Pillow==11.0.0
+Pillow==10.4.0
+accelerate>=0.34.0
+sentencepiece
+torch
+transformers==4.52.2
+vosk==0.3.44

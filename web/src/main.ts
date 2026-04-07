@@ -179,6 +179,19 @@ app.innerHTML = `
         <button id="go-camera" class="primary">Camera</button>
         <button id="go-admin">Admin Panel</button>
       </div>
+
+      <div class="button-row">
+        <button id="record-question">Record Question</button>
+        <button id="stop-question" class="ghost">Stop And Send</button>
+      </div>
+
+      <label class="toggle">
+        <input id="tts-toggle" type="checkbox" />
+        Speak guidance text
+      </label>
+
+      <p>Status: <strong id="status">idle</strong></p>
+      <p id="answer-output" class="answer-output">No answer yet.</p>
     </section>
 
     <section id="camera-page" class="page hidden">
@@ -286,11 +299,16 @@ const cameraPreviewEl = mustQuery<HTMLVideoElement>("#camera-preview");
 const adminLivePreviewEl = mustQuery<HTMLImageElement>("#admin-live-preview");
 const adminLiveStatusEl = mustQuery<HTMLElement>("#admin-live-status");
 const connectionBadgeEl = mustQuery<HTMLElement>("#connection-badge");
+const ttsToggleEl = mustQuery<HTMLInputElement>("#tts-toggle");
+const statusEl = mustQuery<HTMLElement>("#status");
+const answerOutputEl = mustQuery<HTMLElement>("#answer-output");
 const statusApiEl = mustQuery<HTMLElement>("#status-api");
 const statusPeerEl = mustQuery<HTMLElement>("#status-peer");
 const statusIceEl = mustQuery<HTMLElement>("#status-ice");
 const statusSessionIdEl = mustQuery<HTMLElement>("#status-session-id");
 const statusSessionCountEl = mustQuery<HTMLElement>("#status-session-count");
+const recordQuestionEl = mustQuery<HTMLButtonElement>("#record-question");
+const stopQuestionEl = mustQuery<HTMLButtonElement>("#stop-question");
 const statusSendFpsEl = mustQuery<HTMLElement>("#status-send-fps");
 const statusAnalysisFpsEl = mustQuery<HTMLElement>("#status-analysis-fps");
 const statusIncomingFpsEl = mustQuery<HTMLElement>("#status-incoming-fps");
@@ -299,10 +317,13 @@ const statusDroppedFramesEl = mustQuery<HTMLElement>("#status-dropped-frames");
 const statusTotalFramesEl = mustQuery<HTMLElement>("#status-total-frames");
 const eventLogEl = mustQuery<HTMLUListElement>("#event-log");
 
-let currentPage: PageName = "home";
-let activeTheme: ThemeName = loadStoredTheme() ?? "dark";
 let activeStream: MediaStream | null = null;
 let activeSessionId: string | null = null;
+let questionRecorder: MediaRecorder | null = null;
+let questionChunks: Blob[] = [];
+let audioResponsePlayer: HTMLAudioElement | null = null;
+let discardRecordedQuestion = false;
+const AUDIO_CHUNK_SIZE = 16_000;
 let peerState: RTCPeerConnectionState = "closed";
 const sendTargetFps = SEND_TARGET_FPS;
 let latestHealthStatus = "unknown";
@@ -311,6 +332,8 @@ let latestSelectedSession: DebugSession | null = null;
 let adminPreviewSessionId: string | null = null;
 let adminPreviewHasSnapshot = false;
 let viewportConstraintTimer: number | null = null;
+let currentPage: PageName = "home";
+let activeTheme: ThemeName = loadStoredTheme() ?? "dark";
 const logger = new UiLogger(eventLogEl);
 const apiBaseUrl = getSignalingBaseUrl();
 const errorCache = new Map<string, string>();
@@ -333,6 +356,7 @@ adminLivePreviewEl.addEventListener("error", () => {
 const webrtc = new WebRtcClient(
   (state) => {
     peerState = state;
+    statusEl.textContent = state;
     renderConnectionBadge();
     renderLatestDashboard();
   },
@@ -401,8 +425,28 @@ window.setInterval(() => {
 }, ADMIN_PREVIEW_POLL_MS);
 
 window.addEventListener("beforeunload", () => {
+  resetQuestionRecorder();
+  if (audioResponsePlayer) {
+    audioResponsePlayer.pause();
+  }
   stopStream(activeStream);
   void webrtc.disconnect();
+});
+
+recordQuestionEl.addEventListener("click", () => {
+  try {
+    startQuestionRecording();
+  } catch (error) {
+    logger.log(`Question recording failed: ${String(error)}`);
+  }
+});
+
+stopQuestionEl.addEventListener("click", async () => {
+  try {
+    await stopQuestionRecording();
+  } catch (error) {
+    logger.log(`Question send failed: ${String(error)}`);
+  }
 });
 
 showPage("home");
@@ -538,19 +582,6 @@ function updateViewportLayout(): void {
     cameraPreviewEl.videoHeight >= cameraPreviewEl.videoWidth
       ? "portrait"
       : "landscape";
-
-  if (!activeStream) {
-    return;
-  }
-
-  if (viewportConstraintTimer !== null) {
-    window.clearTimeout(viewportConstraintTimer);
-  }
-
-  viewportConstraintTimer = window.setTimeout(() => {
-    viewportConstraintTimer = null;
-    void applyViewportCameraConstraints();
-  }, 120);
 }
 
 async function applyViewportCameraConstraints(): Promise<void> {
@@ -728,20 +759,138 @@ function showAdminLiveStatus(message: string): void {
   adminLiveStatusEl.hidden = false;
 }
 
-async function fetchHealthStatus(): Promise<string> {
-  try {
-    const response = await fetch(`${apiBaseUrl}/health`);
-    if (!response.ok) {
-      throw new Error(`status ${response.status}`);
+function startQuestionRecording(): void {
+  if (!activeStream) {
+    throw new Error("Start a source before recording a question");
+  }
+  if (!webrtc.isReadyToSend()) {
+    throw new Error("Connect before sending a question");
+  }
+  if (questionRecorder && questionRecorder.state !== "inactive") {
+    throw new Error("Question recording is already in progress");
+  }
+  if (typeof MediaRecorder === "undefined") {
+    throw new Error("MediaRecorder is not available in this browser");
+  }
+
+  const audioTracks = activeStream.getAudioTracks();
+  if (!audioTracks.length) {
+    throw new Error("The active source does not include a microphone track");
+  }
+
+  questionChunks = [];
+  discardRecordedQuestion = false;
+  const mimeType = pickRecorderMimeType();
+  const recorderStream = new MediaStream(audioTracks);
+  questionRecorder = mimeType
+    ? new MediaRecorder(recorderStream, { mimeType })
+    : new MediaRecorder(recorderStream);
+
+  questionRecorder.ondataavailable = (event) => {
+    if (event.data.size > 0) {
+      questionChunks.push(event.data);
+    }
+  };
+
+  questionRecorder.onerror = (event) => {
+    logger.log(`Question recorder error: ${event.error?.message ?? "unknown error"}`);
+  };
+
+  questionRecorder.onstop = () => {
+    const recorder = questionRecorder;
+    questionRecorder = null;
+    const shouldDiscard = discardRecordedQuestion;
+    discardRecordedQuestion = false;
+    if (shouldDiscard) {
+      questionChunks = [];
+      return;
+    }
+    if (!recorder || !questionChunks.length) {
+      logger.log("No question audio captured");
+      questionChunks = [];
+      return;
     }
 
-    const payload = (await response.json()) as { status?: string };
-    clearError("health");
-    return payload.status ?? "unknown";
-  } catch (error) {
-    logErrorOnce("health", `Health check failed: ${String(error)}`);
-    return "unreachable";
+    void sendRecordedQuestion(new Blob(questionChunks, { type: recorder.mimeType }));
+    questionChunks = [];
+  };
+
+  questionRecorder.start();
+  logger.log("Recording question...");
+}
+
+async function stopQuestionRecording(): Promise<void> {
+  if (!questionRecorder || questionRecorder.state === "inactive") {
+    throw new Error("No active question recording");
   }
+
+  questionRecorder.stop();
+}
+
+function resetQuestionRecorder(): void {
+  if (questionRecorder && questionRecorder.state !== "inactive") {
+    discardRecordedQuestion = true;
+    questionRecorder.stop();
+  }
+  questionRecorder = null;
+  questionChunks = [];
+}
+
+function pickRecorderMimeType(): string | undefined {
+  const candidates = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg;codecs=opus"];
+  return candidates.find((candidate) => MediaRecorder.isTypeSupported(candidate));
+}
+
+function createUploadId(): string {
+  return `audio-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+async function sendRecordedQuestion(audioBlob: Blob): Promise<void> {
+  if (!webrtc.isReadyToSend()) {
+    throw new Error("Connection closed before the question was sent");
+  }
+
+  const arrayBuffer = await audioBlob.arrayBuffer();
+  const bytes = new Uint8Array(arrayBuffer);
+  let binary = "";
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+
+  const audioBase64 = btoa(binary);
+  const totalChunks = Math.max(1, Math.ceil(audioBase64.length / AUDIO_CHUNK_SIZE));
+  const uploadId = createUploadId();
+
+  logger.log(
+    `Sending question audio: ${bytes.length} bytes, ${audioBase64.length} base64 chars, ${totalChunks} chunk(s)`
+  );
+
+  if (totalChunks === 1) {
+    webrtc.sendJson({
+      type: "question_audio",
+      audio_base64: audioBase64,
+      audio_mime_type: audioBlob.type || "application/octet-stream"
+    });
+    logger.log("Question audio sent");
+    return;
+  }
+
+  for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex += 1) {
+    const start = chunkIndex * AUDIO_CHUNK_SIZE;
+    const end = start + AUDIO_CHUNK_SIZE;
+    const chunkData = audioBase64.slice(start, end);
+
+    webrtc.sendJson({
+      type: "question_audio_chunk",
+      upload_id: uploadId,
+      chunk_index: chunkIndex,
+      total_chunks: totalChunks,
+      chunk_data: chunkData,
+      audio_mime_type: audioBlob.type || "application/octet-stream"
+    });
+  }
+
+  logger.log("Question audio sent");
 }
 
 async function fetchDebugSessions(): Promise<DebugSession[]> {
@@ -800,6 +949,22 @@ function clearError(key: string): void {
   errorCache.delete(key);
 }
 
+async function fetchHealthStatus(): Promise<string> {
+  try {
+    const response = await fetch(`${apiBaseUrl}/health`);
+    if (!response.ok) {
+      throw new Error(`status ${response.status}`);
+    }
+
+    const payload = (await response.json()) as { status?: string };
+    clearError("health");
+    return typeof payload.status === "string" ? payload.status : "unknown";
+  } catch (error) {
+    logErrorOnce("health", `Health check failed: ${String(error)}`);
+    return "unreachable";
+  }
+}
+
 function handleInferencePayload(rawPayload: string): void {
   let parsed: unknown;
   try {
@@ -810,15 +975,53 @@ function handleInferencePayload(rawPayload: string): void {
   }
 
   if (!isInferenceMessage(parsed)) {
-    logger.log(`Data message: ${rawPayload}`);
+    const candidate = parsed as Record<string, unknown>;
+    if (typeof candidate.answer === "string") {
+      answerOutputEl.textContent = candidate.answer;
+    }
+    if (typeof candidate.message === "string") {
+      logger.log(candidate.message);
+    } else {
+      logger.log(`Data message: ${rawPayload}`);
+    }
+    if (typeof candidate.audio_base64 === "string" && candidate.audio_base64.length > 0) {
+      playReturnedAudio(candidate.audio_base64);
+    }
     return;
   }
 
   const message = parsed as InferenceMessage;
+  logger.log(`Inference tick: ${message.timestamp}`);
   if (message.guidance_text) {
     logger.log(`Guidance: ${message.guidance_text}`);
-    return;
   }
 
-  logger.log(`Inference tick: ${message.timestamp}`);
+  const candidate = parsed as Record<string, unknown>;
+  if (typeof candidate.answer === "string") {
+    answerOutputEl.textContent = candidate.answer;
+  }
+
+  if (typeof candidate.audio_base64 === "string" && candidate.audio_base64.length > 0) {
+    playReturnedAudio(candidate.audio_base64);
+  }
+
+  if (ttsToggleEl.checked && message.guidance_text) {
+    const utterance = new SpeechSynthesisUtterance(message.guidance_text);
+    utterance.rate = 1;
+    speechSynthesis.cancel();
+    speechSynthesis.speak(utterance);
+  }
+}
+
+function playReturnedAudio(audioBase64: string): void {
+  const audioUrl = `data:audio/mpeg;base64,${audioBase64}`;
+  if (audioResponsePlayer) {
+    audioResponsePlayer.pause();
+  }
+
+  const player = new Audio(audioUrl);
+  audioResponsePlayer = player;
+  void player.play().catch((error) => {
+    logger.log(`Audio playback failed: ${String(error)}`);
+  });
 }

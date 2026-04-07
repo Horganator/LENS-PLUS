@@ -3,11 +3,17 @@ services:
     build:
       context: ./api
     ports:
-      - "8000:8000"
+      - "8000:8000"     
     environment:
       - ANALYSIS_TARGET_FPS=${ANALYSIS_TARGET_FPS:-5}
+      - VOSK_MODEL_PATH=${VOSK_MODEL_PATH:-/app/models/vosk-model}
+      - SMOLVLM_MODEL_ID=${SMOLVLM_MODEL_ID:-HuggingFaceTB/SmolVLM-256M-Instruct}
+      - SMOLVLM_MAX_NEW_TOKENS=${SMOLVLM_MAX_NEW_TOKENS:-120}
+      - SMOLVLM_NUM_BEAMS=${SMOLVLM_NUM_BEAMS:-1}
+      - ENABLE_MOCK_RESULTS=${ENABLE_MOCK_RESULTS:-false}
     volumes:
       - ./api/app:/app/app
+      - ./api/models:/app/models
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 10s
