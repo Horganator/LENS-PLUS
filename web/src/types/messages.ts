@@ -4,10 +4,29 @@ export type ObjectDetection = {
   bbox?: [number, number, number, number];
 };
 
+export type DirectionalContext = {
+  sample_timestamp_ms?: number | null;
+  server_received_at?: string;
+  age_ms?: number;
+  is_stale?: boolean;
+  rotation_rate_dps?: {
+    alpha?: number | null;
+    beta?: number | null;
+    gamma?: number | null;
+  } | null;
+  orientation_deg?: {
+    alpha?: number | null;
+    beta?: number | null;
+    gamma?: number | null;
+    absolute?: boolean | null;
+  } | null;
+};
+
 export type InferenceMessage = {
   timestamp: string;
   guidance_text?: string;
   scene_summary?: string;
+  directional?: DirectionalContext | null;
   objects?: ObjectDetection[];
 };
 

@@ -50,6 +50,7 @@ MIN_ANALYSIS_TARGET_FPS = 1.0
 MAX_ANALYSIS_TARGET_FPS = 30.0
 FPS_WINDOW_SECONDS = 1.0
 SESSION_MANIFEST_FILENAME = "session.json"
+MAX_DIRECTIONAL_SAMPLE_AGE_MS = 5000
 
 
 def clamp_analysis_fps(value: float) -> float:
@@ -108,6 +109,13 @@ class Session:
     dumped_frames: int = 0
     dump_errors: int = 0
     last_dump_error: str | None = None
+    directional_samples_received: int = 0
+    directional_messages_ignored: int = 0
+    directional_parse_errors: int = 0
+    latest_directional_sample: dict[str, Any] | None = None
+    latest_directional_received_at: datetime | None = None
+    latest_directional_client_timestamp_ms: int | None = None
+    latest_processed_directional: dict[str, Any] | None = None
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -178,6 +186,18 @@ async def debug_sessions() -> dict[str, list[dict[str, Any]]]:
                 "dumped_frames": session.dumped_frames,
                 "dump_errors": session.dump_errors,
                 "last_dump_error": session.last_dump_error,
+                "directional_samples_received": session.directional_samples_received,
+                "directional_messages_ignored": session.directional_messages_ignored,
+                "directional_parse_errors": session.directional_parse_errors,
+                "latest_directional_received_at": (
+                    session.latest_directional_received_at.isoformat()
+                    if session.latest_directional_received_at
+                    else None
+                ),
+                "latest_directional_client_timestamp_ms": (
+                    session.latest_directional_client_timestamp_ms
+                ),
+                "latest_processed_directional": session.latest_processed_directional,
                 "updated_at": session.updated_at.isoformat(),
             }
         )
@@ -285,6 +305,11 @@ async def offer(payload: OfferRequest) -> OfferResponse:
                     next_analysis_at = now_mono + analysis_interval_seconds
                     session.processed_frames += 1
                     window_processed_frames += 1
+                    directional_context = build_directional_context_for_frame(
+                        session=session,
+                        frame_at=now,
+                    )
+                    session.latest_processed_directional = directional_context
 
                     frame_jpeg, frame_jpeg_error = frame_to_jpeg(frame)
                     if frame_jpeg:
@@ -292,6 +317,7 @@ async def offer(payload: OfferRequest) -> OfferResponse:
                             session=session,
                             frame_jpeg=frame_jpeg,
                             frame_at=now,
+                            directional_context=directional_context,
                         )
 
                         if (now - last_snapshot_at).total_seconds() >= 0.5:
@@ -313,6 +339,10 @@ async def offer(payload: OfferRequest) -> OfferResponse:
     def on_datachannel(channel: Any) -> None:
         session.data_channel = channel
         session.updated_at = datetime.now(timezone.utc)
+
+        @channel.on("message")
+        def on_message(message: Any) -> None:
+            ingest_directional_message(session=session, message=message)
 
         @channel.on("open")
         def on_open() -> None:
@@ -383,6 +413,7 @@ async def send_mock_results(session: Session) -> None:
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "guidance_text": f"Caution: {label} ahead.",
             "scene_summary": f"Detected one {label} in view.",
+            "directional": session.latest_processed_directional,
             "objects": [
                 {
                     "label": label,
@@ -399,6 +430,141 @@ async def send_mock_results(session: Session) -> None:
             break
 
         await asyncio.sleep(1)
+
+
+def ingest_directional_message(session: Session, message: Any) -> None:
+    payload: Any = message
+    if isinstance(payload, bytes):
+        try:
+            payload = payload.decode("utf-8")
+        except UnicodeDecodeError:
+            session.directional_parse_errors += 1
+            return
+
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except json.JSONDecodeError:
+            session.directional_parse_errors += 1
+            return
+
+    normalized_payload = normalize_directional_payload(payload)
+    if normalized_payload is None:
+        session.directional_messages_ignored += 1
+        return
+
+    now = datetime.now(timezone.utc)
+    session.directional_samples_received += 1
+    session.latest_directional_sample = normalized_payload
+    session.latest_directional_received_at = now
+    session.latest_directional_client_timestamp_ms = normalized_payload["timestamp_ms"]
+    session.updated_at = now
+
+
+def normalize_directional_payload(payload: Any) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+
+    if payload.get("type") != "client_sensor":
+        return None
+
+    if payload.get("sensor") != "gyro":
+        return None
+
+    timestamp_ms = coerce_optional_int(payload.get("timestamp_ms"))
+    rotation_rate_dps = normalize_rotation_rate(payload.get("rotation_rate_dps"))
+    orientation_deg = normalize_orientation(payload.get("orientation_deg"))
+
+    if rotation_rate_dps is None and orientation_deg is None:
+        return None
+
+    return {
+        "timestamp_ms": timestamp_ms,
+        "rotation_rate_dps": rotation_rate_dps,
+        "orientation_deg": orientation_deg,
+    }
+
+
+def normalize_rotation_rate(value: Any) -> dict[str, float | None] | None:
+    if not isinstance(value, dict):
+        return None
+
+    alpha = coerce_finite_float(value.get("alpha"))
+    beta = coerce_finite_float(value.get("beta"))
+    gamma = coerce_finite_float(value.get("gamma"))
+    if alpha is None and beta is None and gamma is None:
+        return None
+
+    return {
+        "alpha": alpha,
+        "beta": beta,
+        "gamma": gamma,
+    }
+
+
+def normalize_orientation(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+
+    alpha = coerce_finite_float(value.get("alpha"))
+    beta = coerce_finite_float(value.get("beta"))
+    gamma = coerce_finite_float(value.get("gamma"))
+    absolute = value.get("absolute") if isinstance(value.get("absolute"), bool) else None
+    if alpha is None and beta is None and gamma is None and absolute is None:
+        return None
+
+    return {
+        "alpha": alpha,
+        "beta": beta,
+        "gamma": gamma,
+        "absolute": absolute,
+    }
+
+
+def coerce_finite_float(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+
+    if isinstance(value, (int, float)) and math.isfinite(value):
+        return float(value)
+
+    return None
+
+
+def coerce_optional_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+
+    if isinstance(value, int):
+        return value
+
+    if isinstance(value, float) and math.isfinite(value):
+        return int(value)
+
+    return None
+
+
+def build_directional_context_for_frame(
+    session: Session,
+    frame_at: datetime,
+) -> dict[str, Any] | None:
+    latest_directional_sample = session.latest_directional_sample
+    latest_directional_received_at = session.latest_directional_received_at
+    if latest_directional_sample is None or latest_directional_received_at is None:
+        return None
+
+    age_ms = max(
+        0,
+        int(round((frame_at - latest_directional_received_at).total_seconds() * 1000)),
+    )
+    return {
+        "sample_timestamp_ms": latest_directional_sample.get("timestamp_ms"),
+        "server_received_at": latest_directional_received_at.isoformat(),
+        "age_ms": age_ms,
+        "is_stale": age_ms > MAX_DIRECTIONAL_SAMPLE_AGE_MS,
+        "rotation_rate_dps": latest_directional_sample.get("rotation_rate_dps"),
+        "orientation_deg": latest_directional_sample.get("orientation_deg"),
+    }
 
 
 async def close_session(session_id: str) -> None:
@@ -485,7 +651,10 @@ def create_session_artifact(
 
 
 def persist_processed_frame(
-    session: Session, frame_jpeg: bytes, frame_at: datetime
+    session: Session,
+    frame_jpeg: bytes,
+    frame_at: datetime,
+    directional_context: dict[str, Any] | None,
 ) -> None:
     if session.artifact_dir is None:
         return
@@ -495,9 +664,17 @@ def persist_processed_frame(
         f"{frame_at.strftime('%Y%m%dT%H%M%S%fZ')}.jpg"
     )
     frame_path = session.artifact_dir / frame_name
+    metadata_path = frame_path.with_suffix(".json")
+    frame_metadata = {
+        "frame_name": frame_name,
+        "frame_index": session.processed_frames,
+        "frame_at": frame_at.isoformat(),
+        "directional": directional_context,
+    }
 
     try:
         frame_path.write_bytes(frame_jpeg)
+        metadata_path.write_text(json.dumps(frame_metadata, indent=2) + "\n")
         session.dumped_frames += 1
         session.last_dump_error = None
     except Exception as error:
@@ -525,6 +702,18 @@ def build_session_manifest(
         "dumped_frames": session.dumped_frames,
         "dump_errors": session.dump_errors,
         "last_dump_error": session.last_dump_error,
+        "directional_samples_received": session.directional_samples_received,
+        "directional_messages_ignored": session.directional_messages_ignored,
+        "directional_parse_errors": session.directional_parse_errors,
+        "latest_directional_received_at": (
+            session.latest_directional_received_at.isoformat()
+            if session.latest_directional_received_at
+            else None
+        ),
+        "latest_directional_client_timestamp_ms": (
+            session.latest_directional_client_timestamp_ms
+        ),
+        "latest_processed_directional": session.latest_processed_directional,
         "latest_jpeg_at": (
             session.latest_jpeg_at.isoformat() if session.latest_jpeg_at else None
         ),

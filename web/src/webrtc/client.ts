@@ -7,6 +7,7 @@ type LogHandler = (message: string) => void;
 export class WebRtcClient {
   private peerConnection: RTCPeerConnection | null = null;
   private videoSender: RTCRtpSender | null = null;
+  private dataChannel: RTCDataChannel | null = null;
   private sessionId: string | null = null;
   private pendingIceCandidates: RTCIceCandidate[] = [];
   private connectionStateHandler: ConnectionStateHandler;
@@ -35,11 +36,18 @@ export class WebRtcClient {
     const peerConnection = new RTCPeerConnection({ iceServers: [] });
     this.peerConnection = peerConnection;
     this.videoSender = null;
+    this.dataChannel = null;
     this.pendingIceCandidates = [];
 
     const channel = peerConnection.createDataChannel("results");
+    this.dataChannel = channel;
     channel.onopen = () => this.logHandler("Data channel open");
-    channel.onclose = () => this.logHandler("Data channel closed");
+    channel.onclose = () => {
+      if (this.dataChannel === channel) {
+        this.dataChannel = null;
+      }
+      this.logHandler("Data channel closed");
+    };
     channel.onmessage = (event) => this.dataMessageHandler(String(event.data));
 
     for (const track of stream.getTracks()) {
@@ -126,6 +134,21 @@ export class WebRtcClient {
     }
   }
 
+  sendJson(payload: unknown): boolean {
+    const channel = this.dataChannel;
+    if (!channel || channel.readyState !== "open") {
+      return false;
+    }
+
+    try {
+      channel.send(JSON.stringify(payload));
+      return true;
+    } catch (error: unknown) {
+      this.logHandler(`Data channel send failed: ${String(error)}`);
+      return false;
+    }
+  }
+
   private async sendIce(candidate: RTCIceCandidate): Promise<void> {
     if (!this.sessionId) {
       return;
@@ -148,6 +171,7 @@ export class WebRtcClient {
       this.peerConnection = null;
     }
     this.videoSender = null;
+    this.dataChannel = null;
     this.sessionId = null;
     this.pendingIceCandidates = [];
     this.connectionStateHandler("closed");
