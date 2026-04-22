@@ -1,7 +1,8 @@
 import os
 import sys
-import json
 import re
+import time
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -18,6 +19,22 @@ from ultralytics import YOLO
 
 import network
 
+
+# ==========================================================
+# CONFIG
+# ==========================================================
+
+OUTPUT_DIR = r"D:\Zayaan\D_git\LENS-PLUS\models\segmentation\output"
+
+OUTPUT_WIDTH = 640
+OUTPUT_HEIGHT = 360
+
+MERGE_IDLE_SECONDS = 40
+
+
+# ==========================================================
+# CITYSCAPES ACCESSIBILITY MAPPER
+# ==========================================================
 
 class CityscapesAccessibilityMapper:
     def __init__(self):
@@ -43,9 +60,11 @@ class CityscapesAccessibilityMapper:
             "bicycle",
         ]
 
-        self.walkable_classes = [1, 9]
-        self.hazard_classes = [0]
-        self.dynamic_obstacle_classes = [11, 12, 13, 14, 15, 16, 17, 18]
+        self.walkable_classes = [1, 9]  # sidewalk, terrain
+        self.hazard_classes = [0]       # road
+        self.dynamic_obstacle_classes = [
+            11, 12, 13, 14, 15, 16, 17, 18
+        ]
 
     def get_walkable_mask(self, preds):
         mask = np.zeros_like(preds, dtype=np.uint8)
@@ -68,18 +87,10 @@ class CityscapesAccessibilityMapper:
     def get_traffic_sign_mask(self, preds):
         return (preds == 7).astype(np.uint8)
 
-    def get_class_distribution(self, preds):
-        total = preds.size
-        result = {}
 
-        for i, name in enumerate(self.class_names):
-            count = np.sum(preds == i)
-            pct = (count / total) * 100
-            if pct > 0:
-                result[name] = round(float(pct), 2)
-
-        return result
-
+# ==========================================================
+# SEGMENTATION + NAVIGATION
+# ==========================================================
 
 class ImprovedSegmentation:
     def __init__(
@@ -87,33 +98,22 @@ class ImprovedSegmentation:
         frames_root: str,
         yolo_model_path: str,
         deeplab_model_path: str,
-        output_video_path: str,
-        output_json_path: Optional[str] = None,
         target_fps: int = 10,
         use_yolo: bool = True,
         deeplab_every_n_frames: int = 2,
     ):
-        self.frames_root = frames_root
-        self.yolo_model_path = yolo_model_path
-        self.deeplab_model_path = deeplab_model_path
-        self.output_video_path = output_video_path
-        self.output_json_path = (
-            output_json_path
-            or output_video_path.replace(".mp4", "_metrics.json")
-        )
-
+        self.frames_root = Path(frames_root)
         self.target_fps = target_fps
         self.use_yolo = use_yolo
         self.deeplab_every_n_frames = deeplab_every_n_frames
 
+        self.mapper = CityscapesAccessibilityMapper()
+
         self.prev_walkable_mask = None
         self.prev_hazard_mask = None
-        self.target_size = None
-        self.frame_metrics = []
 
-        self.yolo_model = YOLO(self.yolo_model_path) if self.use_yolo else None
-        self.deeplab_model = self.load_deeplab()
-        self.mapper = CityscapesAccessibilityMapper()
+        self.yolo_model = YOLO(yolo_model_path) if use_yolo else None
+        self.deeplab_model = self.load_deeplab(deeplab_model_path)
 
         self.transform = transforms.Compose(
             [
@@ -127,29 +127,40 @@ class ImprovedSegmentation:
             ]
         )
 
+    # ------------------------------------------------------
+    # HELPERS
+    # ------------------------------------------------------
+
     def natural_key(self, path):
         return [
             int(t) if t.isdigit() else t.lower()
             for t in re.split(r"(\d+)", path.name)
         ]
 
-    def find_frame_folder(self):
-        root = Path(self.frames_root)
+    def find_latest_artifact(self):
+        artifacts = [
+            p for p in self.frames_root.iterdir()
+            if p.is_dir()
+        ]
 
-        if not root.exists():
-            raise FileNotFoundError(f"{root} does not exist")
+        if not artifacts:
+            raise FileNotFoundError("No artifacts found")
 
-        subfolders = [p for p in root.iterdir() if p.is_dir()]
-
-        if not subfolders:
-            raise FileNotFoundError(f"No subfolders found in {root}")
-
-        subfolders.sort(
+        artifacts.sort(
             key=lambda p: p.stat().st_mtime,
-            reverse=True,
+            reverse=True
         )
 
-        return subfolders[0]
+        return artifacts[0]
+
+    def get_group_folders(self, artifact_dir):
+        groups = [
+            p for p in artifact_dir.iterdir()
+            if p.is_dir() and p.name.startswith("group-")
+        ]
+
+        groups.sort(key=self.natural_key)
+        return groups
 
     def load_frame_paths(self, folder):
         exts = {".jpg", ".jpeg", ".png", ".bmp"}
@@ -159,20 +170,21 @@ class ImprovedSegmentation:
             if p.suffix.lower() in exts
         ]
 
-        if not frames:
-            raise FileNotFoundError(f"No image frames found in {folder}")
-
         frames.sort(key=self.natural_key)
         return frames
 
-    def load_deeplab(self):
+    # ------------------------------------------------------
+    # MODEL LOADING
+    # ------------------------------------------------------
+
+    def load_deeplab(self, path):
         model = network.modeling.__dict__["deeplabv3plus_mobilenet"](
             num_classes=19,
             output_stride=16,
         )
 
         checkpoint = torch.load(
-            self.deeplab_model_path,
+            path,
             map_location="cpu",
             weights_only=False,
         )
@@ -185,6 +197,37 @@ class ImprovedSegmentation:
         model.eval()
         return model
 
+    # ------------------------------------------------------
+    # FPS FROM FRAME TIMESTAMPS
+    # ------------------------------------------------------
+
+    def infer_real_fps(self, frame_paths):
+        if len(frame_paths) < 2:
+            return self.target_fps
+
+        def parse_timestamp(path):
+            stamp = path.stem.split("-")[-1]
+            return datetime.strptime(
+                stamp,
+                "%Y%m%dT%H%M%S%fZ"
+            )
+
+        start = parse_timestamp(frame_paths[0])
+        end = parse_timestamp(frame_paths[-1])
+
+        seconds = (end - start).total_seconds()
+
+        if seconds <= 0:
+            return self.target_fps
+
+        fps = len(frame_paths) / seconds
+
+        return max(1, round(fps))
+
+    # ------------------------------------------------------
+    # SEGMENTATION
+    # ------------------------------------------------------
+
     def get_semantic_predictions(self, image):
         rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         tensor = self.transform(rgb).unsqueeze(0)
@@ -194,37 +237,22 @@ class ImprovedSegmentation:
 
         preds = outputs.max(1)[1].cpu().numpy()[0]
 
-        h, w = image.shape[:2]
-
         preds = cv2.resize(
             preds.astype(np.uint8),
-            (w, h),
+            (OUTPUT_WIDTH, OUTPUT_HEIGHT),
             interpolation=cv2.INTER_NEAREST,
         )
 
         return preds
 
-    def compute_temporal_iou(self, a, b):
-        if a is None or b is None:
-            return 0.0
-
-        if a.shape != b.shape:
-            a = cv2.resize(
-                a.astype(np.uint8),
-                (b.shape[1], b.shape[0]),
-                interpolation=cv2.INTER_NEAREST,
-            )
-
-        inter = np.logical_and(a, b).sum()
-        union = np.logical_or(a, b).sum()
-
-        return float(inter / union) if union > 0 else 0.0
+    # ------------------------------------------------------
+    # TEMPORAL SMOOTHING
+    # ------------------------------------------------------
 
     def apply_temporal_smoothing(
         self,
         current_mask,
-        previous_mask,
-        alpha=0.7,
+        previous_mask
     ):
         if previous_mask is None:
             return current_mask.astype(np.uint8)
@@ -232,60 +260,114 @@ class ImprovedSegmentation:
         if current_mask.shape != previous_mask.shape:
             previous_mask = cv2.resize(
                 previous_mask.astype(np.uint8),
-                (current_mask.shape[1], current_mask.shape[0]),
+                (
+                    current_mask.shape[1],
+                    current_mask.shape[0],
+                ),
                 interpolation=cv2.INTER_NEAREST,
             )
 
         smoothed = (
-            alpha * current_mask.astype(np.float32)
-            + (1.0 - alpha) * previous_mask.astype(np.float32)
+            0.7 * current_mask.astype(np.float32)
+            + 0.3 * previous_mask.astype(np.float32)
         )
 
         return (smoothed > 0.5).astype(np.uint8)
 
-    def analyze_safety(self, walkable, hazard, dynamic):
+    # ------------------------------------------------------
+    # NAVIGATION LOGIC
+    # ------------------------------------------------------
+
+    def analyze_navigation(
+        self,
+        walkable,
+        hazard,
+        dynamic
+    ):
         h, w = walkable.shape
-        total = h * w
 
-        walkable_pct = float(np.sum(walkable) / total * 100)
-        hazard_pct = float(np.sum(hazard) / total * 100)
-        obstacle_pct = float(np.sum(dynamic) / total * 100)
+        # use lower half (closer to user)
+        walkable = walkable[h // 2:, :]
+        hazard = hazard[h // 2:, :]
+        dynamic = dynamic[h // 2:, :]
 
-        center_col = walkable[:, w // 2]
-        path_clear = bool(np.sum(center_col) / len(center_col) > 0.6)
+        third = w // 3
 
-        if hazard_pct > 30:
-            status = "UNWALKABLE"
-            detail = "high road presence"
-        elif walkable_pct >= 50 and path_clear:
-            status = "WALKABLE"
-            detail = "clear path"
-        elif walkable_pct >= 30:
-            status = "WALKABLE"
-            detail = "proceed with caution"
-        elif walkable_pct >= 15:
-            status = "WALKABLE"
-            detail = "limited safe area"
+        zones = {
+            "LEFT": slice(0, third),
+            "CENTER": slice(third, third * 2),
+            "RIGHT": slice(third * 2, w),
+        }
+
+        scores = {}
+
+        for name, zone in zones.items():
+            walk = np.sum(walkable[:, zone])
+            haz = np.sum(hazard[:, zone])
+            obs = np.sum(dynamic[:, zone])
+
+            score = walk - (haz * 2) - (obs * 1.5)
+            scores[name] = score
+
+        best_zone = max(scores, key=scores.get)
+
+        center_good = (
+            scores["CENTER"]
+            >= max(scores["LEFT"], scores["RIGHT"]) * 0.9
+        )
+
+        if center_good:
+            direction = "FORWARD"
+        elif best_zone == "LEFT":
+            direction = "MOVE LEFT"
         else:
-            status = "UNWALKABLE"
-            detail = "no safe path"
+            direction = "MOVE RIGHT"
 
-        if obstacle_pct > 20:
-            warning = "multiple obstacles"
-        elif obstacle_pct > 5:
-            warning = "obstacles present"
+        total_pixels = walkable.size
+
+        hazard_ratio = np.sum(hazard) / total_pixels
+
+        if hazard_ratio > 0.35:
+            status = "UNWALKABLE"
         else:
-            warning = "path clear"
+            status = "WALKABLE"
 
         return {
-            "walkable_percentage": round(walkable_pct, 2),
-            "hazard_percentage": round(hazard_pct, 2),
-            "obstacle_percentage": round(obstacle_pct, 2),
-            "path_clear": path_clear,
-            "navigation_status": status,
-            "navigation_detail": detail,
-            "obstacle_warning": warning,
+            "status": status,
+            "direction": direction,
+            "scores": scores,
         }
+
+    def draw_navigation_arrow(
+        self,
+        frame,
+        direction
+    ):
+        h, w = frame.shape[:2]
+
+        start = (w // 2, h - 40)
+
+        if direction == "FORWARD":
+            end = (w // 2, h - 140)
+
+        elif direction == "MOVE LEFT":
+            end = (w // 2 - 140, h - 110)
+
+        else:
+            end = (w // 2 + 140, h - 110)
+
+        cv2.arrowedLine(
+            frame,
+            start,
+            end,
+            (0, 255, 0),
+            6,
+            tipLength=0.25,
+        )
+
+    # ------------------------------------------------------
+    # VISUALIZATION
+    # ------------------------------------------------------
 
     def create_visualization(
         self,
@@ -295,37 +377,17 @@ class ImprovedSegmentation:
         hazard,
         dynamic,
         signs,
-        safety,
-        frame_idx,
     ):
         if yolo_results is not None:
             overlay = yolo_results[0].plot()
-
-            if overlay.shape[:2] != image.shape[:2]:
-                overlay = cv2.resize(
-                    overlay,
-                    (image.shape[1], image.shape[0]),
-                    interpolation=cv2.INTER_LINEAR,
-                )
+            overlay = cv2.resize(
+                overlay,
+                (OUTPUT_WIDTH, OUTPUT_HEIGHT),
+            )
         else:
             overlay = image.copy()
 
         overlay = overlay.astype(np.float32)
-        h, w = overlay.shape[:2]
-
-        def fix_mask(mask):
-            if mask.shape[:2] != (h, w):
-                mask = cv2.resize(
-                    mask.astype(np.uint8),
-                    (w, h),
-                    interpolation=cv2.INTER_NEAREST,
-                )
-            return mask.astype(np.uint8)
-
-        walkable = fix_mask(walkable)
-        hazard = fix_mask(hazard)
-        dynamic = fix_mask(dynamic)
-        signs = fix_mask(signs)
 
         green = np.zeros_like(overlay)
         green[:] = [0, 255, 0]
@@ -341,99 +403,82 @@ class ImprovedSegmentation:
 
         def blend(base, mask, color, alpha):
             mask3 = np.stack([mask, mask, mask], axis=2)
+
             return np.where(
                 mask3 > 0,
                 base * (1 - alpha) + color * alpha,
                 base,
             )
 
-        overlay = blend(overlay, walkable, green, 0.40)
-        overlay = blend(overlay, hazard, red, 0.50)
-        overlay = blend(overlay, dynamic, yellow, 0.50)
+        overlay = blend(overlay, walkable, green, 0.45)
+        overlay = blend(overlay, hazard, red, 0.55)
+        overlay = blend(overlay, dynamic, yellow, 0.55)
         overlay = blend(overlay, signs, cyan, 0.50)
 
         overlay = overlay.astype(np.uint8)
 
+        nav = self.analyze_navigation(
+            walkable,
+            hazard,
+            dynamic,
+        )
+
+        self.draw_navigation_arrow(
+            overlay,
+            nav["direction"],
+        )
+
         lines = [
-            f"frame: {frame_idx}",
-            f"walkable: {safety['walkable_percentage']}%",
-            f"hazard: {safety['hazard_percentage']}%",
-            f"obstacles: {safety['obstacle_percentage']}%",
-            safety["navigation_status"],
-            safety["navigation_detail"],
-            safety["obstacle_warning"],
+            f"STATUS: {nav['status']}",
+            f"DIRECTION: {nav['direction']}",
         ]
 
         y = 30
+
         for line in lines:
             cv2.putText(
                 overlay,
                 line,
                 (15, y),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
+                0.75,
                 (255, 255, 255),
                 2,
             )
-            y += 28
+            y += 34
 
         return overlay
 
-    def save_metrics(self):
-        if not self.frame_metrics:
+    # ------------------------------------------------------
+    # GROUP PROCESSING
+    # ------------------------------------------------------
+
+    def process_group(
+        self,
+        frame_paths,
+        output_path
+    ):
+        if not frame_paths:
             return
 
-        avg_walkable = np.mean(
-            [f["safety"]["walkable_percentage"] for f in self.frame_metrics]
-        )
+        self.prev_walkable_mask = None
+        self.prev_hazard_mask = None
 
-        avg_hazard = np.mean(
-            [f["safety"]["hazard_percentage"] for f in self.frame_metrics]
-        )
-
-        avg_iou = np.mean(
-            [
-                f["temporal_consistency"]["walkable_iou"]
-                for f in self.frame_metrics
-            ]
-        )
-
-        summary = {
-            "total_frames": len(self.frame_metrics),
-            "average_metrics": {
-                "walkable_percentage": round(float(avg_walkable), 2),
-                "hazard_percentage": round(float(avg_hazard), 2),
-                "temporal_consistency": round(float(avg_iou), 3),
-            },
-            "frame_details": self.frame_metrics,
-        }
-
-        with open(self.output_json_path, "w") as f:
-            json.dump(summary, f, indent=2)
-
-    def run(self):
-        os.makedirs(os.path.dirname(self.output_video_path), exist_ok=True)
-
-        frame_folder = self.find_frame_folder()
-        frame_paths = self.load_frame_paths(frame_folder)
-
-        print("Using:", frame_folder)
-        print("Frames:", len(frame_paths))
-
-        first = cv2.imread(str(frame_paths[0]))
-        if first is None:
-            return
-
-        h, w = first.shape[:2]
+        fps = self.infer_real_fps(frame_paths)
 
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
 
         out = cv2.VideoWriter(
-            self.output_video_path,
+            str(output_path),
             fourcc,
-            self.target_fps,
-            (w, h)
+            fps,
+            (OUTPUT_WIDTH, OUTPUT_HEIGHT),
         )
+
+        if not out.isOpened():
+            raise RuntimeError(
+                f"Could not open writer {output_path}"
+            )
 
         processed_count = 0
         segmentation_cache = None
@@ -441,16 +486,20 @@ class ImprovedSegmentation:
         for frame_path in frame_paths:
 
             frame = cv2.imread(str(frame_path))
+
             if frame is None:
                 continue
 
-            frame = cv2.resize(frame, (w, h))
+            frame = cv2.resize(
+                frame,
+                (OUTPUT_WIDTH, OUTPUT_HEIGHT)
+            )
 
             if self.use_yolo:
                 yolo_results = self.yolo_model(
                     frame,
                     conf=0.5,
-                    verbose=False
+                    verbose=False,
                 )
             else:
                 yolo_results = None
@@ -468,18 +517,12 @@ class ImprovedSegmentation:
 
             walkable = self.apply_temporal_smoothing(
                 walkable,
-                self.prev_walkable_mask
+                self.prev_walkable_mask,
             )
 
             hazard = self.apply_temporal_smoothing(
                 hazard,
-                self.prev_hazard_mask
-            )
-
-            safety = self.analyze_safety(
-                walkable,
-                hazard,
-                dynamic
+                self.prev_hazard_mask,
             )
 
             viz = self.create_visualization(
@@ -489,11 +532,8 @@ class ImprovedSegmentation:
                 hazard,
                 dynamic,
                 signs,
-                safety,
-                processed_count
             )
 
-            viz = cv2.resize(viz, (w, h))
             out.write(viz)
 
             self.prev_walkable_mask = walkable
@@ -502,10 +542,155 @@ class ImprovedSegmentation:
             processed_count += 1
 
         out.release()
-        self.save_metrics()
 
-        print("Done:", self.output_video_path)
+    # ------------------------------------------------------
+    # MERGE VIDEOS
+    # ------------------------------------------------------
 
+    def merge_group_videos(
+        self,
+        artifact_name
+    ):
+        output_dir = Path(OUTPUT_DIR)
+
+        mp4s = list(
+            output_dir.glob(
+                f"{artifact_name}_group-*.mp4"
+            )
+        )
+
+        if not mp4s:
+            return
+
+        mp4s.sort(key=self.natural_key)
+
+        final_path = output_dir / (
+            f"{artifact_name}_FINAL.mp4"
+        )
+
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+
+        out = cv2.VideoWriter(
+            str(final_path),
+            fourcc,
+            self.target_fps,
+            (OUTPUT_WIDTH, OUTPUT_HEIGHT),
+        )
+
+        if not out.isOpened():
+            raise RuntimeError(
+                f"Cannot create {final_path}"
+            )
+
+        for video in mp4s:
+
+            cap = cv2.VideoCapture(str(video))
+
+            while True:
+                ret, frame = cap.read()
+
+                if not ret:
+                    break
+
+                if frame is None:
+                    continue
+
+                frame = cv2.resize(
+                    frame,
+                    (
+                        OUTPUT_WIDTH,
+                        OUTPUT_HEIGHT,
+                    )
+                )
+
+                out.write(frame)
+
+            cap.release()
+
+        out.release()
+
+        print("Merged:", final_path)
+
+    # ------------------------------------------------------
+    # MAIN LOOP
+    # ------------------------------------------------------
+
+    def run(self):
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+        processed_groups = set()
+
+        last_new_group_time = time.time()
+        last_merged_count = 0
+
+        while True:
+
+            artifact = self.find_latest_artifact()
+            groups = self.get_group_folders(artifact)
+
+            new_group_found = False
+
+            for group in groups:
+
+                key = f"{artifact.name}_{group.name}"
+
+                if key in processed_groups:
+                    continue
+
+                frame_paths = self.load_frame_paths(group)
+
+                if not frame_paths:
+                    continue
+
+                print("Processing:", group)
+
+                output_path = Path(OUTPUT_DIR) / (
+                    f"{key}.mp4"
+                )
+
+                try:
+                    self.process_group(
+                        frame_paths,
+                        output_path,
+                    )
+
+                    processed_groups.add(key)
+                    new_group_found = True
+
+                except Exception as error:
+                    print(
+                        "Group failed:",
+                        group,
+                        error,
+                    )
+
+            if new_group_found:
+                last_new_group_time = time.time()
+
+            idle = time.time() - last_new_group_time
+
+            current_count = len(processed_groups)
+
+            if (
+                idle >= MERGE_IDLE_SECONDS
+                and current_count > 0
+                and current_count != last_merged_count
+            ):
+                self.merge_group_videos(
+                    artifact.name
+                )
+
+                last_merged_count = current_count
+
+                print("Session complete.")
+                break
+
+            time.sleep(2)
+
+
+# ==========================================================
+# ENTRY
+# ==========================================================
 
 if __name__ == "__main__":
     model = ImprovedSegmentation(
@@ -525,13 +710,9 @@ if __name__ == "__main__":
             BASE_DIR,
             "deeplabv3plus-mobilenet.pth",
         ),
-        output_video_path=os.path.join(
-            BASE_DIR,
-            "..",
-            "output",
-            "improved_segmented_video.mp4",
-        ),
-        target_fps=10,
+        target_fps=5,
+        use_yolo=True,
+        deeplab_every_n_frames=2,
     )
 
     model.run()
