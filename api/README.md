@@ -261,7 +261,18 @@ In `api/app/main.py`, each video frame is received in `consume_frames()`.
 Every session creates:
 
 - `frame-*.jpg` files for each processed frame
-- `session.json` metadata with counters, timestamps, and dump status
+- `frame-*.json` metadata for each processed frame
+- `session.json` metadata with counters, timestamps, dump status, and latest detection state
+
+`frame-*.json` includes:
+
+- `frame_id` / `frame_index`
+- `frame_at`
+- `directional` context (if available)
+- `detections`:
+  - `objects` (label, confidence, bbox)
+  - `metrics` (`num_detections`, `avg_confidence`, `max_confidence`, `min_confidence`)
+  - inference timestamp and staleness (`age_ms`, `is_stale`)
 
 `app/session_artifacts/` is ignored by git and excluded from Docker build context.
 

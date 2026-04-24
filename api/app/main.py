@@ -50,7 +50,9 @@ MIN_ANALYSIS_TARGET_FPS = 1.0
 MAX_ANALYSIS_TARGET_FPS = 30.0
 FPS_WINDOW_SECONDS = 1.0
 SESSION_MANIFEST_FILENAME = "session.json"
+MAX_INFERENCE_SAMPLE_AGE_MS = 3000
 MAX_DIRECTIONAL_SAMPLE_AGE_MS = 5000
+GROUP_SESSION_TIME_CUT_SECONDS = 30
 
 
 def clamp_analysis_fps(value: float) -> float:
@@ -116,6 +118,10 @@ class Session:
     latest_directional_received_at: datetime | None = None
     latest_directional_client_timestamp_ms: int | None = None
     latest_processed_directional: dict[str, Any] | None = None
+    inference_messages_emitted: int = 0
+    latest_inference_payload: dict[str, Any] | None = None
+    latest_inference_at: datetime | None = None
+    latest_processed_detections: dict[str, Any] | None = None
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -222,6 +228,13 @@ async def debug_sessions() -> dict[str, list[dict[str, Any]]]:
                     session.latest_directional_client_timestamp_ms
                 ),
                 "latest_processed_directional": session.latest_processed_directional,
+                "inference_messages_emitted": session.inference_messages_emitted,
+                "latest_inference_at": (
+                    session.latest_inference_at.isoformat()
+                    if session.latest_inference_at
+                    else None
+                ),
+                "latest_processed_detections": session.latest_processed_detections,
                 "updated_at": session.updated_at.isoformat(),
             }
         )
@@ -353,6 +366,11 @@ async def offer(payload: OfferRequest) -> OfferResponse:
                         frame_at=now,
                     )
                     session.latest_processed_directional = directional_context
+                    detection_context = build_detection_context_for_frame(
+                        session=session,
+                        frame_at=now,
+                    )
+                    session.latest_processed_detections = detection_context
 
                     processed_frame_jpeg = snapshot_jpeg
                     processed_frame_error = snapshot_error
@@ -367,6 +385,7 @@ async def offer(payload: OfferRequest) -> OfferResponse:
                             frame_jpeg=processed_frame_jpeg,
                             frame_at=now,
                             directional_context=directional_context,
+                            detection_context=detection_context,
                         )
                     else:
                         session.dump_errors += 1
@@ -470,6 +489,8 @@ async def send_mock_results(session: Session) -> None:
 
         try:
             channel.send(json.dumps(payload))
+            update_latest_inference(session=session, payload=payload)
+            session.inference_messages_emitted += 1
             session.updated_at = datetime.now(timezone.utc)
         except Exception:
             break
@@ -612,6 +633,86 @@ def build_directional_context_for_frame(
     }
 
 
+def update_latest_inference(session: Session, payload: dict[str, Any]) -> None:
+    now = datetime.now(timezone.utc)
+    session.latest_inference_payload = payload
+    session.latest_inference_at = now
+
+
+def normalize_inference_objects(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_objects = payload.get("objects")
+    if not isinstance(raw_objects, list):
+        return []
+
+    normalized_objects: list[dict[str, Any]] = []
+    for raw_obj in raw_objects:
+        if not isinstance(raw_obj, dict):
+            continue
+        label = raw_obj.get("label")
+        confidence = raw_obj.get("confidence")
+        bbox = raw_obj.get("bbox")
+        if not isinstance(label, str):
+            continue
+        confidence_value = None
+        if isinstance(confidence, (int, float)) and math.isfinite(confidence):
+            confidence_value = float(confidence)
+
+        normalized_bbox = None
+        if isinstance(bbox, list) and len(bbox) == 4:
+            parsed_bbox: list[float] = []
+            for value in bbox:
+                if isinstance(value, (int, float)) and math.isfinite(value):
+                    parsed_bbox.append(float(value))
+            if len(parsed_bbox) == 4:
+                normalized_bbox = parsed_bbox
+
+        normalized_objects.append(
+            {
+                "label": label,
+                "confidence": confidence_value,
+                "bbox": normalized_bbox,
+            }
+        )
+    return normalized_objects
+
+
+def build_detection_context_for_frame(
+    session: Session,
+    frame_at: datetime,
+) -> dict[str, Any] | None:
+    payload = session.latest_inference_payload
+    inference_at = session.latest_inference_at
+    if payload is None or inference_at is None:
+        return None
+
+    objects = normalize_inference_objects(payload)
+    confidences = [
+        item["confidence"] for item in objects if isinstance(item.get("confidence"), float)
+    ]
+    age_ms = max(0, int(round((frame_at - inference_at).total_seconds() * 1000)))
+
+    metrics = {
+        "num_detections": len(objects),
+        "num_with_confidence": len(confidences),
+        "avg_confidence": (
+            round(sum(confidences) / len(confidences), 4) if confidences else None
+        ),
+        "max_confidence": round(max(confidences), 4) if confidences else None,
+        "min_confidence": round(min(confidences), 4) if confidences else None,
+    }
+
+    return {
+        "inference_timestamp": payload.get("timestamp"),
+        "server_inference_received_at": inference_at.isoformat(),
+        "age_ms": age_ms,
+        "is_stale": age_ms > MAX_INFERENCE_SAMPLE_AGE_MS,
+        "scene_summary": payload.get("scene_summary"),
+        "guidance_text": payload.get("guidance_text"),
+        "objects": objects,
+        "metrics": metrics,
+    }
+
+
 async def close_session(session_id: str) -> None:
     session = sessions.pop(session_id, None)
     if not session:
@@ -695,26 +796,47 @@ def create_session_artifact(
     return artifact_id, artifact_dir, artifact_manifest_path, None
 
 
+def get_group_dir(artifact_dir: Path, started_at: datetime, frame_at: datetime) -> Path:
+    elapsed_seconds = max(0.0, (frame_at - started_at).total_seconds())
+    group_number = int(elapsed_seconds // GROUP_SESSION_TIME_CUT_SECONDS) + 1
+    group_dir = artifact_dir / f"group-{group_number:03d}"
+    group_dir.mkdir(parents=True, exist_ok=True)
+    return group_dir
+
+
 def persist_processed_frame(
     session: Session,
     frame_jpeg: bytes,
     frame_at: datetime,
     directional_context: dict[str, Any] | None,
+    detection_context: dict[str, Any] | None,
 ) -> None:
     if session.artifact_dir is None:
         return
+
+    group_dir = get_group_dir(
+        artifact_dir=session.artifact_dir,
+        started_at=session.started_at,
+        frame_at=frame_at,
+    )
 
     frame_name = (
         f"frame-{session.processed_frames:06d}-"
         f"{frame_at.strftime('%Y%m%dT%H%M%S%fZ')}.jpg"
     )
-    frame_path = session.artifact_dir / frame_name
+    frame_path = group_dir / frame_name
     metadata_path = frame_path.with_suffix(".json")
+    elapsed_seconds = max(0.0, (frame_at - session.started_at).total_seconds())
+    group_number = int(elapsed_seconds // GROUP_SESSION_TIME_CUT_SECONDS) + 1
     frame_metadata = {
+        "frame_id": session.processed_frames,
         "frame_name": frame_name,
         "frame_index": session.processed_frames,
         "frame_at": frame_at.isoformat(),
+        "group_id": group_number,
+        "group_dir": group_dir.name,
         "directional": directional_context,
+        "detections": detection_context,
     }
 
     try:
@@ -759,6 +881,13 @@ def build_session_manifest(
             session.latest_directional_client_timestamp_ms
         ),
         "latest_processed_directional": session.latest_processed_directional,
+        "inference_messages_emitted": session.inference_messages_emitted,
+        "latest_inference_at": (
+            session.latest_inference_at.isoformat()
+            if session.latest_inference_at
+            else None
+        ),
+        "latest_processed_detections": session.latest_processed_detections,
         "latest_jpeg_at": (
             session.latest_jpeg_at.isoformat() if session.latest_jpeg_at else None
         ),
