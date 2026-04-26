@@ -54,83 +54,82 @@ With Docker Compose (root `docker-compose.yml`), this value is passed into the `
 ANALYSIS_TARGET_FPS=${ANALYSIS_TARGET_FPS:-15}
 ```
 
-## IoU testing (course-ready)
+## Evaluation and tests
 
-This repo now includes a plug-and-play IoU evaluation module:
+The evaluation helpers live here:
 
 - `app/evaluation/iou.py`
 - `app/evaluation/detection_metrics.py`
 - `app/evaluation/segmentation_metrics.py`
 
-Core tests:
+To run the full test suite:
 
 ```bash
 cd api
 python -m unittest discover -s tests -v
 ```
 
-This now covers:
+The tests cover:
 
-- IoU correctness (`xyxy` + `xywh`)
-- precision / recall / F1 at IoU threshold
+- IoU math (`xyxy` and `xywh`)
+- precision / recall / F1 at IoU thresholds
 - class-aware and class-agnostic matching
-- per-class metrics
-- confusion matrix
+- per-class metrics and confusion matrix
 - `mAP@0.5` and `mAP@0.5:0.95`
 - segmentation metrics (`Dice`, pixel accuracy, mask IoU, multiclass mIoU)
-- API integration + failure-path tests
+- API integration and common failure paths
 
-Install extra benchmarking/evaluation dependencies:
+If you want to run the benchmark/evaluation scripts, install the extra deps:
 
 ```bash
 cd api
 pip install -r requirements-dev.txt
 ```
 
-### 1) Detection metrics report (IoU/F1/mAP/per-class/confusion)
+### Detection report (IoU/F1/mAP/per-class/confusion)
 
-Input format example: `examples/detection_eval_sample.json`
+Sample input: `examples/detection_eval_sample.json`
 
 ```bash
 cd api
 python scripts/run_detection_eval.py --input examples/detection_eval_sample.json
 ```
 
-Optional save:
+Save report:
 
 ```bash
 python scripts/run_detection_eval.py --input examples/detection_eval_sample.json --output reports/detection_metrics.json
 ```
 
-### 2) Segmentation metrics report (Dice/PixelAcc/mIoU)
+### Segmentation report (Dice / Pixel Accuracy / mIoU)
 
-Input format example: `examples/segmentation_eval_sample.json`
+Sample input: `examples/segmentation_eval_sample.json`
 
 ```bash
 cd api
 python scripts/run_segmentation_eval.py --input examples/segmentation_eval_sample.json
 ```
 
-Optional save:
+Save report:
 
 ```bash
 python scripts/run_segmentation_eval.py --input examples/segmentation_eval_sample.json --output reports/segmentation_metrics.json
 ```
 
-### 3) Latency/FPS benchmark (avg + p50 + p95 + p99)
+### Latency and FPS benchmark
 
 ```bash
 cd api
 python scripts/run_latency_benchmark.py --model ../yolo11n.pt --source 0 --frames 120 --warmup 20
 ```
 
-Examples:
+`--source` examples:
 
-- webcam: `--source 0`
-- video file: `--source ../some_clip.mp4`
-- backend snapshot URL: `--source http://localhost:8000/debug/sessions/<session_id>/latest.jpg`
+- webcam: `0`
+- video file: `../some_clip.mp4`
+- backend snapshot URL: `http://localhost:8000/debug/sessions/<session_id>/latest.jpg`
 
-### 4) Robustness evaluation (blur/brightness/contrast/jpeg/noise)
+### Robustness evaluation (blur / brightness / contrast / jpeg artifacts / noise)
 
 Input JSON format:
 
@@ -155,32 +154,32 @@ cd api
 python scripts/run_robustness_eval.py --model ../yolo11n.pt --input C:/path/to/robustness_dataset.json --output reports/robustness_report.json
 ```
 
-### 5) Regression gate on metrics
+### Regression check
 
-Use your detection metrics reports as baseline/current:
+Compare current metrics with a baseline:
 
 ```bash
 cd api
 python scripts/run_regression_check.py --baseline reports/baseline_detection_metrics.json --current reports/current_detection_metrics.json --max-map50-drop 0.02 --max-map5095-drop 0.02
 ```
 
-Set absolute minimum bars:
+Set minimum required thresholds:
 
 ```bash
 python scripts/run_regression_check.py --current reports/current_detection_metrics.json --min-map50 0.40 --min-map5095 0.20
 ```
 
-### 6) Integration + failure-path tests
+### API integration and failure-path tests
 
-These are included in `tests/test_api_integration.py` and validate:
+`tests/test_api_integration.py` checks:
 
 - `/health`
 - `/debug/sessions`
 - `/debug/sessions/history`
-- unknown session snapshot (`404`)
-- no-snapshot-yet session (`404`)
-- unknown ICE session (`404`)
-- malformed offer payload (`422`)
+- unknown session snapshot returns `404`
+- no-snapshot-yet returns `404`
+- unknown ICE session returns `404`
+- malformed offer payload returns `422`
 
 ## API contract
 
