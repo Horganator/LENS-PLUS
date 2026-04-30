@@ -39,6 +39,28 @@ A WebRTC prototype streams video from a phone or desktop browser to a FastAPI ba
 - Node.js 18+ and npm (for local frontend workflow)
 - `mkcert` (optional, but recommended for real phone camera testing)
 
+## Model Files Setup
+
+Before running the backend, you need to download the required model files:
+
+1. **Download models from Dropbox:**
+   
+   Access the model files here: [LENS-PLUS Dropbox](https://www.dropbox.com/home/LENS-PLUS)
+
+2. **Place the models in the correct directories:**
+
+   - `deeplabv3plus_mobilenet_finetuned.pth`
+     - Place in: `models/segmentation/src/`
+   
+   - `depth_anything_v2_metric_hypersim_vits.pth`
+     - Place in: `models/depth_estimation/checkpoints/`
+     - **Note:** Create the `checkpoints/` directory if it doesn't exist
+
+```bash
+   # Example: Creating the checkpoints directory
+   mkdir -p models/depth_estimation/checkpoints
+```
+
 ## Environment file
 
 Copy the example env file before running either workflow:
