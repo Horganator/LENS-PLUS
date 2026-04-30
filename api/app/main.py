@@ -847,6 +847,20 @@ def create_session_artifact(
     return artifact_id, artifact_dir, artifact_manifest_path, None
 
 
+<<<<<<< HEAD
+GROUPED_SECONDS = 30 # should be grouped every 30 seconds
+
+
+def persist_processed_frame(session: Session, frame_jpeg: bytes, frame_at: datetime) -> None:
+    if session.artifact_dir is None:
+        return
+
+    if session.started_at is None:
+        session.last_dump_error = "frame dump failed: session.started_at is missing"
+        session.dump_errors += 1
+        return
+=======
+>>>>>>> 50fbd1e89250ea2e92c478e530bab642a4a3717d
 def get_group_dir(artifact_dir: Path, started_at: datetime, frame_at: datetime) -> Path:
     elapsed_seconds = max(0.0, (frame_at - started_at).total_seconds())
     group_number = int(elapsed_seconds // GROUP_SESSION_TIME_CUT_SECONDS) + 1

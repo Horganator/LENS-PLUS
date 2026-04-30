@@ -297,9 +297,6 @@ class ImprovedSegmentation:
         model.eval()
         return model
 
-    # ------------------------------------------------------
-    # FPS FROM FRAME TIMESTAMPS
-    # ------------------------------------------------------
 
     def infer_real_fps(self, frame_paths):
         if len(frame_paths) < 2:
@@ -324,9 +321,6 @@ class ImprovedSegmentation:
 
         return max(1, round(fps))
 
-    # ------------------------------------------------------
-    # SEGMENTATION
-    # ------------------------------------------------------
 
     def get_semantic_predictions(self, image):
         rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
@@ -342,9 +336,6 @@ class ImprovedSegmentation:
 
         return preds
 
-    # ------------------------------------------------------
-    # TEMPORAL SMOOTHING
-    # ------------------------------------------------------
 
     def apply_temporal_smoothing(
         self,
@@ -371,9 +362,6 @@ class ImprovedSegmentation:
 
         return (smoothed > 0.5).astype(np.uint8)
 
-    # ------------------------------------------------------
-    # NAVIGATION LOGIC
-    # ------------------------------------------------------
 
     def analyze_navigation(
         self,
