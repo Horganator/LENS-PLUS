@@ -45,7 +45,7 @@ Before running the backend, you need to download the required model files:
 
 1. **Download models from Dropbox:**
    
-   Access the model files here: [LENS-PLUS Dropbox](https://www.dropbox.com/home/LENS-PLUS)
+   Access the model files here: [LENS-PLUS Dropbox](https://www.dropbox.com/scl/fo/e7wcpej7kzxjdm7qqyulo/AN6OHj5xWruEfk5qEqyan6s?rlkey=gg16nhb58a7rfd0rdv9j75e6p&st=kw2e3fbt&dl=0)
 
 2. **Place the models in the correct directories:**
 
