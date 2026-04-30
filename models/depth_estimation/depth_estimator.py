@@ -3,6 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 import time
 import os
 import sys
+import argparse
 
 os.environ["XFORMERS_DISABLED"] = "1"
 sys.modules["xformers"] = None
@@ -251,6 +252,7 @@ class DepthEstimator:
         target_fps: int = 10,
         max_depth: float = 10.0,
         camera_hfov_deg: float = 70.0,
+        write_video: bool = True
     ):
         self.frames_root = Path(frames_root)
         self.checkpoint_path = checkpoint_path
@@ -275,6 +277,7 @@ class DepthEstimator:
             hfov_deg=camera_hfov_deg,
         )
         self.distance_estimator = ObjectDistanceEstimator(self.intrinsics)
+        self.write_video = write_video
 
     def _load_model(self) -> DepthAnythingV2:
         config = {**self.MODEL_CONFIGS[self.variant], "max_depth": self.max_depth}
@@ -508,20 +511,20 @@ class DepthEstimator:
         accumulator = FrameMetricsAccumulator()
 
         fps = self.infer_real_fps(frame_paths)
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        out = cv2.VideoWriter(
-            str(output_path), fourcc, fps, (OUTPUT_WIDTH, OUTPUT_HEIGHT)
-        )
-
-        if not out.isOpened():
-            raise RuntimeError(f"Could not open writer: {output_path}")
+        out = None
+        if self.write_video:
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            out = cv2.VideoWriter(
+                str(output_path), fourcc, fps, (OUTPUT_WIDTH, OUTPUT_HEIGHT)
+            )
+            if not out.isOpened():
+                raise RuntimeError(f"Could not open writer: {output_path}")
 
         frame_metrics = []
         prev_status = None
         prev_zone_nearest = None
 
         for idx, (frame_path, frame) in enumerate(zip(frame_paths, frames)):
-            # frame = cv2.imread(str(frame_path))
             if frame is None:
                 continue
 
@@ -564,10 +567,11 @@ class DepthEstimator:
                 zone_stability=zone_stability,
             )
 
-            viz = self.create_visualisation(frame, depth, analysis, idx, located)
-            viz = cv2.resize(viz, (OUTPUT_WIDTH, OUTPUT_HEIGHT))
-            out.write(viz)
-
+            if out is not None:
+                viz = self.create_visualisation(frame, depth, analysis, idx, located)
+                viz = cv2.resize(viz, (OUTPUT_WIDTH, OUTPUT_HEIGHT))
+                out.write(viz)
+                
             frame_metrics.append({
                 "frame": frame_path.name,
                 "analysis": {
@@ -604,7 +608,8 @@ class DepthEstimator:
                 f"{analysis['proximity_detail']}{distance_summary}  ({latency_ms:.0f}ms)"
             )
 
-        out.release()
+        if out is not None:
+            out.release()
 
         app_metrics = accumulator.summarise(frame_metrics)
 
@@ -727,18 +732,19 @@ class DepthEstimator:
                     print(f"Group failed: {group} — {error}")
             
             unmerged_count = len(processed_order) - last_merged_count
-            if unmerged_count >= DEMO_BATCH_SIZE:
-                batch_keys = processed_order[last_merged_count : last_merged_count + DEMO_BATCH_SIZE]
-                self.merge_n_groups(artifact.name, batch_keys, demo_batch_num)
-                last_merged_count += DEMO_BATCH_SIZE
-                demo_batch_num += 1
+            if self.write_video:
+                if unmerged_count >= DEMO_BATCH_SIZE:
+                    batch_keys = processed_order[last_merged_count : last_merged_count + DEMO_BATCH_SIZE]
+                    self.merge_n_groups(artifact.name, batch_keys, demo_batch_num)
+                    last_merged_count += DEMO_BATCH_SIZE
+                    demo_batch_num += 1
 
-            elif is_closed and unmerged_count > 0:
-                print(f"Flushing final {unmerged_count} leftover groups into a demo...")
-                batch_keys = processed_order[last_merged_count:]
-                self.merge_n_groups(artifact.name, batch_keys, demo_batch_num)
-                last_merged_count += unmerged_count
-                demo_batch_num += 1
+                elif is_closed and unmerged_count > 0:
+                    print(f"Flushing final {unmerged_count} leftover groups into a demo...")
+                    batch_keys = processed_order[last_merged_count:]
+                    self.merge_n_groups(artifact.name, batch_keys, demo_batch_num)
+                    last_merged_count += unmerged_count
+                    demo_batch_num += 1
 
             if new_group_found:
                 last_new_group_time = time.time()
@@ -749,7 +755,15 @@ class DepthEstimator:
 
             time.sleep(2)
 
+def _parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--no-video", action="store_true",
+                        help="Skip mp4 writing")
+    return parser.parse_args()
+
 if __name__ == "__main__":
+    args = _parse_args()
+
     model = DepthEstimator(
         checkpoint_path=os.path.join(
             BASE_DIR, "checkpoints", "depth_anything_v2_metric_hypersim_vits.pth"
@@ -759,6 +773,7 @@ if __name__ == "__main__":
         ),
         target_fps=10,
         max_depth=10.0,
-        camera_hfov_deg=70.0
+        camera_hfov_deg=70.0,
+        write_video=not args.no_video,
     )
     model.run()

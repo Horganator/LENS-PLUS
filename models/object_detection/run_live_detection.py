@@ -3,6 +3,7 @@ import sys
 import re
 import json
 import time
+import argparse
 from datetime import datetime
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
@@ -41,10 +42,12 @@ class ObjectDetector:
         model_path: str = "yolov8n.pt",
         conf: float = 0.5,
         target_fps: int = 5,
+        write_video: bool = True
     ):
         self.frames_root = Path(frames_root)
         self.target_fps  = target_fps
         self.conf        = conf
+        self.write_video = write_video
 
         print(f"Loading YOLO model: {model_path}")
         self.model = YOLO(model_path)
@@ -99,12 +102,15 @@ class ObjectDetector:
             frames = list(ex.map(read_and_resize, frame_paths))
         print(f"  Loaded in {(time.perf_counter() - t_io)*1000:.0f}ms")
 
-        fps    = self.infer_real_fps(frame_paths)
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        out    = cv2.VideoWriter(str(output_path), fourcc, fps, (OUTPUT_WIDTH, OUTPUT_HEIGHT))
-
-        if not out.isOpened():
-            raise RuntimeError(f"Could not open writer: {output_path}")
+        fps = self.infer_real_fps(frame_paths)
+        out = None
+        if self.write_video:
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            out = cv2.VideoWriter(
+                str(output_path), fourcc, fps, (OUTPUT_WIDTH, OUTPUT_HEIGHT)
+            )
+            if not out.isOpened():
+                raise RuntimeError(f"Could not open writer: {output_path}")
 
         frame_summaries = []
         total_detections = 0
@@ -120,8 +126,6 @@ class ObjectDetector:
             latency_ms = (time.perf_counter() - t0) * 1000
 
             detections = []
-            annotated  = results[0].plot()
-            annotated  = cv2.resize(annotated, (OUTPUT_WIDTH, OUTPUT_HEIGHT))
 
             if results[0].boxes is not None:
                 for box in results[0].boxes:
@@ -138,7 +142,11 @@ class ObjectDetector:
             sidecar = frame_path.with_suffix(".detections.json")
             sidecar.write_text(json.dumps({"detections": detections}, indent=2))
 
-            out.write(annotated)
+            if out is not None:
+                annotated = results[0].plot()
+                annotated = cv2.resize(annotated, (OUTPUT_WIDTH, OUTPUT_HEIGHT))
+                out.write(annotated)
+
             total_detections += len(detections)
 
             labels_str = ", ".join(d["label"] for d in detections) if detections else "none"
@@ -153,7 +161,8 @@ class ObjectDetector:
                 "inference_latency_ms": round(latency_ms, 2),
             })
 
-        out.release()
+        if out is not None:
+            out.release()
 
         return {
             "total_frames":      len(frame_summaries),
@@ -244,27 +253,34 @@ class ObjectDetector:
                     print(f"  Group failed: {group.name} — {error}")
 
             unmerged = len(processed_order) - last_merged_count
-            if unmerged >= DEMO_BATCH_SIZE:
-                batch_keys = processed_order[last_merged_count : last_merged_count + DEMO_BATCH_SIZE]
-                self.merge_n_groups(artifact.name, batch_keys, demo_batch_num)
-                last_merged_count += DEMO_BATCH_SIZE
-                demo_batch_num    += 1
-
-            elif is_closed and unmerged > 0:
-                print(f"  Flushing final {unmerged} group(s) into demo...")
-                batch_keys = processed_order[last_merged_count:]
-                self.merge_n_groups(artifact.name, batch_keys, demo_batch_num)
-                last_merged_count += unmerged
-                demo_batch_num    += 1
+            if self.write_video:
+                if unmerged >= DEMO_BATCH_SIZE:
+                    batch_keys = processed_order[last_merged_count : last_merged_count + DEMO_BATCH_SIZE]
+                    self.merge_n_groups(artifact.name, batch_keys, demo_batch_num)
+                    last_merged_count += DEMO_BATCH_SIZE
+                    demo_batch_num    += 1
+                elif is_closed and unmerged > 0:
+                    print(f"  Flushing final {unmerged} group(s) into demo...")
+                    batch_keys = processed_order[last_merged_count:]
+                    self.merge_n_groups(artifact.name, batch_keys, demo_batch_num)
+                    last_merged_count += unmerged
+                    demo_batch_num    += 1
 
             time.sleep(2)
 
+def _parse_args():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--no-video", action="store_true")
+    return parser.parse_args()
 
 if __name__ == "__main__":
+    args = _parse_args()
     detector = ObjectDetector(
         frames_root=str(APP_DIR / "session_artifacts"),
         model_path="yolov8n.pt",
         conf=0.3,
         target_fps=5,
+        write_video=not args.no_video,
     )
     detector.run()

@@ -7,8 +7,8 @@ from pathlib import Path
 from typing import Optional
 import json
 import statistics
+import argparse
 from time import perf_counter
-
 
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BASE_DIR.parents[2]
@@ -98,6 +98,7 @@ class ImprovedSegmentation:
         target_fps: int = 10,
         use_yolo: bool = True,
         deeplab_every_n_frames: int = 2,
+        write_video: bool = True,
     ):
         self.frames_root = Path(frames_root)
         self.target_fps = target_fps
@@ -123,7 +124,7 @@ class ImprovedSegmentation:
                 ),
             ]
         )
-
+        self.write_video = write_video
 
     def get_model_size_mb(self):
         total_params = sum(p.numel() for p in self.deeplab_model.parameters())
@@ -565,15 +566,14 @@ class ImprovedSegmentation:
         
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         
-        out = cv2.VideoWriter(
-            str(output_path),
-            fourcc,
-            fps,
-            (OUTPUT_WIDTH, OUTPUT_HEIGHT),
-        )
-
-        if not out.isOpened():
-            raise RuntimeError(f"Could not open writer {output_path}")
+        out = None
+        if self.write_video:
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            out = cv2.VideoWriter(
+                str(output_path), fourcc, fps, (OUTPUT_WIDTH, OUTPUT_HEIGHT)
+            )
+            if not out.isOpened():
+                raise RuntimeError(f"Could not open writer {output_path}")
 
         processed_count = 0
         segmentation_cache = None
@@ -649,17 +649,17 @@ class ImprovedSegmentation:
 
             nav = self.analyze_navigation(walkable, hazard, dynamic)
 
-            viz = self.create_visualization(
-                frame,
-                yolo_results,
-                walkable,
-                hazard,
-                dynamic,
-                signs,
-                nav
-            )
-
-            out.write(viz)
+            if out is not None:
+                viz = self.create_visualization(
+                    frame,
+                    yolo_results,
+                    walkable,
+                    hazard,
+                    dynamic,
+                    signs,
+                    nav
+                )
+                out.write(viz)
 
             nav_sidecar = frame_path.with_suffix(".navigation.json")
             nav_sidecar.write_text(json.dumps({
@@ -685,7 +685,8 @@ class ImprovedSegmentation:
 
             processed_count += 1
 
-        out.release()
+        if out is not None:
+            out.release()
 
         metrics = self.calculate_group_metrics(
             ious,
@@ -790,18 +791,19 @@ class ImprovedSegmentation:
                     print(f"  Done: {group.name}")
 
                 unmerged_count = len(processed_order) - last_merged_count
-                if unmerged_count >= DEMO_BATCH_SIZE:
-                    batch_keys = processed_order[last_merged_count : last_merged_count + DEMO_BATCH_SIZE]
-                    self.merge_group_videos(artifact.name, batch_keys, demo_batch_num)
-                    last_merged_count += DEMO_BATCH_SIZE
-                    demo_batch_num += 1
-                
-                elif is_closed and unmerged_count > 0:
-                    print(f"Flushing final {unmerged_count} leftover groups into a demo...")
-                    batch_keys = processed_order[last_merged_count:]
-                    self.merge_group_videos(artifact.name, batch_keys, demo_batch_num)
-                    last_merged_count += unmerged_count
-                    demo_batch_num += 1
+                if self.write_video:
+                    if unmerged_count >= DEMO_BATCH_SIZE:
+                        batch_keys = processed_order[last_merged_count : last_merged_count + DEMO_BATCH_SIZE]
+                        self.merge_group_videos(artifact.name, batch_keys, demo_batch_num)
+                        last_merged_count += DEMO_BATCH_SIZE
+                        demo_batch_num += 1
+                    
+                    elif is_closed and unmerged_count > 0:
+                        print(f"Flushing final {unmerged_count} leftover groups into a demo...")
+                        batch_keys = processed_order[last_merged_count:]
+                        self.merge_group_videos(artifact.name, batch_keys, demo_batch_num)
+                        last_merged_count += unmerged_count
+                        demo_batch_num += 1
 
             except FileNotFoundError:
                 print("No artifacts found")
@@ -809,6 +811,10 @@ class ImprovedSegmentation:
             time.sleep(0.5)
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--no-video", action="store_true")
+    args = parser.parse_args()
+
     model = ImprovedSegmentation(
         frames_root=f"{APP_DIR}/session_artifacts",
         yolo_model_path=str(BASE_DIR / "yolov8n-seg.pt"),
@@ -816,6 +822,7 @@ if __name__ == "__main__":
         target_fps=10,
         use_yolo=True,
         deeplab_every_n_frames=2,
+        write_video=not args.no_video,
     )
 
     model.run()
