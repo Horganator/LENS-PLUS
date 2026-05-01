@@ -42,106 +42,6 @@ def read_and_resize(path: Path) -> np.ndarray | None:
         return cv2.resize(frame, (OUTPUT_WIDTH, OUTPUT_HEIGHT))
     return None
 
-class FrameMetricsAccumulator:
-    def __init__(self):
-        self.statuses = []
-        self.consistency_scores = []
-        self.latencies_ms = []
-        self.primary_hazards_m = []
-        self.direction_warnings = []
-        self.zone_stabilities = []
-        self.false_obstacle_count = 0
-        self.total_frames = 0
-
-    def record(
-        self,
-        status: str,
-        consistency: float,
-        latency_ms: float,
-        primary_hazard_m: float,
-        direction_warning: str,
-        zone_stability: float,
-        is_known_clear: bool = False,
-    ):
-        self.statuses.append(status)
-        self.consistency_scores.append(consistency)
-        self.latencies_ms.append(latency_ms)
-        self.primary_hazards_m.append(primary_hazard_m)
-        self.direction_warnings.append(direction_warning)
-        self.zone_stabilities.append(zone_stability)
-        self.total_frames += 1
-
-        if is_known_clear and status in {"VERY_CLOSE", "CLOSE"}:
-            self.false_obstacle_count += 1
-
-    def zone_consistency_rate(self) -> float:
-        if len(self.statuses) < 2:
-            return 1.0
-        matches = sum(
-            1 for a, b in zip(self.statuses, self.statuses[1:])
-            if a == b
-        )
-        return round(matches / (len(self.statuses) - 1), 4)
-
-    def summarise(self, frame_metrics: list) -> dict:
-        if not self.latencies_ms:
-            return {}
-
-        min_clearance = round(min(self.primary_hazards_m), 3) if self.primary_hazards_m else float('inf')
-
-        danger_frames = sum(1 for s in self.statuses if s in {"VERY_CLOSE", "CLOSE"})
-        tid_ratio = round(danger_frames / self.total_frames, 4) if self.total_frames > 0 else 0.0
-
-        max_streak = 0
-        current_streak = 0
-        for s in self.statuses:
-            if s in {"VERY_CLOSE", "CLOSE"}:
-                current_streak += 1
-                max_streak = max(max_streak, current_streak)
-            else:
-                current_streak = 0
-
-        status_flips = sum(1 for i in range(1, len(self.statuses)) if self.statuses[i] != self.statuses[i-1])
-        direction_flips = sum(1 for i in range(1, len(self.direction_warnings)) if self.direction_warnings[i] != self.direction_warnings[i-1])
-        zone_stability_variance = round(float(np.var(self.zone_stabilities)), 4) if self.zone_stabilities else 0.0            
-
-        false_rate = (
-            round(self.false_obstacle_count / self.total_frames, 4)
-            if self.total_frames > 0 else 0.0
-        )
-
-        return {
-            "hazard_profiling": {
-                "absolute_min_clearance_m": min_clearance,
-                "time_in_danger_ratio": tid_ratio,
-                "longest_hazard_streak_frames": max_streak,
-            },
-            "temporal_stability": {
-                "status_flips": status_flips,
-                "direction_flips": direction_flips,
-                "zone_stability_variance": zone_stability_variance,
-                "mean_temporal_smoothness": round(float(np.mean(self.consistency_scores)), 4),
-            },
-            "general_metrics": {
-                "zone_consistency_rate": self.zone_consistency_rate(),
-                "mean_depth_variance": round(float(np.mean([f["depth_variance"] for f in frame_metrics])), 4),
-                "mean_edge_density": round(float(np.mean([f["depth_edge_density"] for f in frame_metrics])), 4),
-                "mean_valid_pixel_ratio": round(float(np.mean([f["valid_pixel_ratio"] for f in frame_metrics])), 4),
-                "status_change_rate": round(float(np.mean([f["status_changed"] for f in frame_metrics])), 4),
-                "false_obstacle_rate": false_rate,
-            },
-            "inference_latency_ms": {
-                "mean": round(float(np.mean(self.latencies_ms)), 2),
-                "min":  round(float(np.min(self.latencies_ms)), 2),
-                "max":  round(float(np.max(self.latencies_ms)), 2),
-                "p95":  round(float(np.percentile(self.latencies_ms, 95)), 2),
-            },
-            "status_distribution": {
-                s: self.statuses.count(s)
-                for s in ["CLEAR", "FAR", "MID", "CLOSE", "VERY_CLOSE"]
-            },
-        }
-
 class DepthZoneAnalyser:
     ZONE_THRESHOLDS_M = { # proximity in metres away
         "very_close": 0.8,
@@ -288,27 +188,6 @@ class DepthEstimator:
         model.to(self.device).eval()
         return model
 
-    def predict(self, frame: np.ndarray, bboxes: list[BoundingBox] | None = None) -> dict:
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        with torch.no_grad():
-            depth = self.model.infer_image(rgb)
-
-        depth = self.apply_temporal_smoothing(depth, self.prev_depth)
-        analysis = self.analyser.analyse_zones(depth)
-
-        located = []
-        if bboxes:
-            located = self.distance_estimator.locate(depth, bboxes)
-
-        self.prev_depth = depth
-
-        return {
-            "raw_depth": depth,
-            **analysis,
-            "objects": self.distance_estimator.distances_from_camera(located),
-            "pairwise_distances_m": self.distance_estimator.pairwise_distances(located),
-        }
-
     def natural_key(self, path: Path):
         return [
             int(t) if t.isdigit() else t.lower()
@@ -363,10 +242,54 @@ class DepthEstimator:
             return {}
 
         try:
-            return json.loads(sidecar.read_text())
+            data = json.loads(sidecar.read_text())
+            return data.get("segmentation", {})
         except Exception as error:
             print(f"  navigation parse failed for {frame_path.name}: {error}")
             return {}
+
+    def write_depth_to_json(
+        self,
+        frame_path: Path,
+        analysis: dict,
+        per_object: list,
+        consistency: float,
+        variance: float,
+        edge_density: float,
+        valid_ratio: float,
+        status_changed: bool,
+        zone_stability: float,
+        latency_ms: float,
+    ):
+        sidecar = frame_path.with_suffix(".navigation.json")
+        try:
+            existing = json.loads(sidecar.read_text()) if sidecar.exists() else {}
+        except Exception:
+            existing = {}
+
+        existing["frame"] = frame_path.name
+        existing["timestamp"] = frame_path.stem.split("-")[-1]
+
+        existing["depth"] = {
+            "proximity_status":     analysis["proximity_status"],
+            "proximity_detail":     analysis["proximity_detail"],
+            "primary_hazard_m":     analysis["primary_hazard_m"],
+            "direction_warning":    analysis["direction_warning"],
+            "dominant_zone":        analysis["dominant_zone"],
+            "zone_nearest_m":       analysis["zone_nearest_m"],
+            "zone_mean_m":          analysis["zone_mean_m"],
+            "nearest_m":            analysis["nearest_m"],
+            "objects":              per_object,
+            "temporal_consistency": round(consistency, 4),
+            "depth_variance":       variance,
+            "depth_edge_density":   edge_density,
+            "valid_pixel_ratio":    valid_ratio,
+            "status_changed":       status_changed,
+            "zone_stability_m":     zone_stability,
+            "inference_latency_ms": round(latency_ms, 2),
+        }
+
+        sidecar.write_text(json.dumps(existing, indent=2))
 
     def infer_real_fps(self, frame_paths: list[Path]) -> int:
         if len(frame_paths) < 2:
@@ -438,8 +361,7 @@ class DepthEstimator:
             d_min, d_max = 0.0, self.max_depth
         
         if d_max - d_min > 1e-3:
-            norm = (depth - d_min) / (d_max - d_min)
-            norm = np.clip(norm, 0.0, 1.0)
+            norm = np.clip((depth - d_min) / (d_max - d_min), 0.0, 1.0)
         else:
             norm = np.zeros_like(depth)
 
@@ -508,7 +430,6 @@ class DepthEstimator:
         print(f"Loaded in {(time.perf_counter() - t_io)*1000:.0f}ms")
 
         self.prev_depth = None
-        accumulator = FrameMetricsAccumulator()
 
         fps = self.infer_real_fps(frame_paths)
         out = None
@@ -520,9 +441,9 @@ class DepthEstimator:
             if not out.isOpened():
                 raise RuntimeError(f"Could not open writer: {output_path}")
 
-        frame_metrics = []
         prev_status = None
         prev_zone_nearest = None
+        total_frames = 0
 
         for idx, (frame_path, frame) in enumerate(zip(frame_paths, frames)):
             if frame is None:
@@ -542,10 +463,8 @@ class DepthEstimator:
             edge_density = self.depth_edge_density(depth)
             valid_ratio = self.valid_pixel_ratio(depth)
             bboxes = self.load_detections_for_frame(frame_path)
-            navigation = self.load_navigation_for_frame(frame_path)
             located = self.distance_estimator.locate(depth, bboxes)
             per_object = self.distance_estimator.distances_from_camera(located)
-            pairwise = self.distance_estimator.pairwise_distances(located)
             status_changed = (
                 prev_status is not None and
                 analysis["proximity_status"] != prev_status
@@ -558,43 +477,28 @@ class DepthEstimator:
                 if prev_zone_nearest is not None else 0.0
             )
 
-            accumulator.record(
-                status=analysis["proximity_status"],
-                consistency=consistency,
-                latency_ms=latency_ms,
-                primary_hazard_m=analysis["primary_hazard_m"],
-                direction_warning=analysis["direction_warning"],
-                zone_stability=zone_stability,
-            )
-
             if out is not None:
                 viz = self.create_visualisation(frame, depth, analysis, idx, located)
                 viz = cv2.resize(viz, (OUTPUT_WIDTH, OUTPUT_HEIGHT))
                 out.write(viz)
-                
-            frame_metrics.append({
-                "frame": frame_path.name,
-                "analysis": {
-                    k: v for k, v in analysis.items()
-                    if k not in ("zone_nearest_m", "zone_mean_m")
-                },
-                "zone_nearest_m": analysis["zone_nearest_m"],
-                "zone_mean_m": analysis["zone_mean_m"],
-                "navigation": navigation,
-                "temporal_consistency": consistency,
-                "inference_latency_ms": round(latency_ms, 2),
-                "depth_variance": variance,
-                "depth_edge_density": edge_density,
-                "valid_pixel_ratio": valid_ratio,
-                "status_changed": status_changed,
-                "zone_stability_m": zone_stability,
-                "objects": per_object,
-                "pairwise_distances_m": pairwise,
-            })
+
+            self.write_depth_to_json(
+                frame_path=frame_path,
+                analysis=analysis,
+                per_object=per_object,
+                consistency=consistency,
+                variance=variance,
+                edge_density=edge_density,
+                valid_ratio=valid_ratio,
+                status_changed=status_changed,
+                zone_stability=zone_stability,
+                latency_ms=latency_ms,
+            )
 
             self.prev_depth = depth
             prev_status = analysis["proximity_status"]
             prev_zone_nearest = analysis["zone_nearest_m"].copy()
+            total_frames += 1
 
             distance_summary = ""
             if per_object:
@@ -611,23 +515,15 @@ class DepthEstimator:
         if out is not None:
             out.release()
 
-        app_metrics = accumulator.summarise(frame_metrics)
-
         return {
-            "total_frames": len(frame_metrics),
+            "total_frames": total_frames,
             "inferred_fps": fps,
-            "average_metrics": app_metrics,
-            "frame_details": frame_metrics,
         }
 
     def merge_n_groups(self, artifact_name: str, group_keys: list[str], batch_num: int):
         output_dir = Path(OUTPUT_DIR)
-        mp4s = []
-        for key in group_keys:
-            p = output_dir / f"{key}.mp4"
-            if p.exists():
-                mp4s.append(p)
-
+        mp4s = [output_dir / f"{k}.mp4" for k in group_keys
+                if (output_dir / f"{k}.mp4").exists()]
         if not mp4s:
             return
 
@@ -696,54 +592,33 @@ class DepthEstimator:
                 if not frame_paths:
                     continue
 
-                print(f"[Depth] Processing: {group}")
+                print(f"[Depth] Processing: {group.name}")
 
                 video_path = Path(OUTPUT_DIR) / f"{key}.mp4"
-                metrics_json_path = Path(OUTPUT_DIR) / f"{key}_metrics.json"
-                frames_json_path = Path(OUTPUT_DIR) / f"{key}_frames.json"
 
                 try:
                     results = self.process_group(frame_paths, video_path)
-
-                    group_metrics_data = {
-                        "artifact": artifact.name,
-                        "group": group.name,
-                        "total_frames": results["total_frames"],
-                        "inferred_fps": results["inferred_fps"],
-                        "average_metrics": results["average_metrics"]
-                    }
-
-                    frame_details_data = {
-                        "artifact": artifact.name,
-                        "group": group.name,
-                        "frame_details": results["frame_details"]
-                    }
-
-                    metrics_json_path.write_text(json.dumps(group_metrics_data, indent=2) + "\n")
-                    frames_json_path.write_text(json.dumps(frame_details_data, indent=2) + "\n")
-                    
-                    print(f"  JSON: Saved {metrics_json_path.name} and {frames_json_path.name}")
+                    print(f"  Done: {group.name} ({results['total_frames']} frames)")
 
                     processed_groups.add(key)
                     processed_order.append(key)
                     new_group_found = True
 
                 except Exception as error:
-                    print(f"Group failed: {group} — {error}")
-            
-            unmerged_count = len(processed_order) - last_merged_count
+                    print(f"  Group failed: {group.name} — {error}")
+
             if self.write_video:
-                if unmerged_count >= DEMO_BATCH_SIZE:
+                unmerged = len(processed_order) - last_merged_count
+                if unmerged >= DEMO_BATCH_SIZE:
                     batch_keys = processed_order[last_merged_count : last_merged_count + DEMO_BATCH_SIZE]
                     self.merge_n_groups(artifact.name, batch_keys, demo_batch_num)
                     last_merged_count += DEMO_BATCH_SIZE
-                    demo_batch_num += 1
-
-                elif is_closed and unmerged_count > 0:
-                    print(f"Flushing final {unmerged_count} leftover groups into a demo...")
+                    demo_batch_num    += 1
+                elif is_closed and unmerged > 0:
+                    print(f"  Flushing final {unmerged} group(s) into demo...")
                     batch_keys = processed_order[last_merged_count:]
                     self.merge_n_groups(artifact.name, batch_keys, demo_batch_num)
-                    last_merged_count += unmerged_count
+                    last_merged_count += unmerged
                     demo_batch_num += 1
 
             if new_group_found:

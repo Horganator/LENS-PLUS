@@ -4,9 +4,7 @@ import re
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 import json
-import statistics
 import argparse
 from time import perf_counter
 
@@ -22,11 +20,9 @@ from torchvision import transforms
 from ultralytics import YOLO
 import network
  
-MODELS_DIR = PROJECT_ROOT / "models"
 APP_DIR = PROJECT_ROOT / "api" / "app"
 
 OUTPUT_DIR = PROJECT_ROOT / "models" / "segmentation" / "output"
-JSON_OUTPUT_DIR = OUTPUT_DIR
 
 OUTPUT_WIDTH = 640
 OUTPUT_HEIGHT = 360
@@ -550,10 +546,7 @@ class ImprovedSegmentation:
         self.prev_hazard_mask = None
 
         fps = self.target_fps
-        
-        
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        
+                
         out = None
         if self.write_video:
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -566,13 +559,7 @@ class ImprovedSegmentation:
         processed_count = 0
         segmentation_cache = None
 
-        ious = []
-        inference_times = []
-        focal_losses = []
-        dices = []
-        msds = []
-
-        previous_walkable = None
+        prev_walkable = None
 
         for frame_path in frame_paths:
 
@@ -592,16 +579,14 @@ class ImprovedSegmentation:
             else:
                 yolo_results = None
 
-            t0 = perf_counter()
-
             if processed_count % self.deeplab_every_n_frames == 0:
+                t0 = perf_counter()
                 semantic = self.get_semantic_predictions(frame)
                 segmentation_cache = semantic
+                infer_ms = round((perf_counter() - t0) * 1000, 2)
             else:
                 semantic = segmentation_cache
-
-            infer_ms = (perf_counter() - t0) * 1000
-            inference_times.append(infer_ms)
+                infer_ms = 0.0
 
             walkable = self.mapper.get_walkable_mask(semantic)
             hazard = self.mapper.get_hazard_mask(semantic)
@@ -618,24 +603,17 @@ class ImprovedSegmentation:
                 self.prev_hazard_mask,
             )
 
-            if previous_walkable is not None:
-                iou = self.binary_iou(walkable, previous_walkable)
-                dice = self.dice_score(walkable, previous_walkable)
-                fl = self.focal_loss_binary(
-                    walkable.astype(np.float32),
-                    previous_walkable.astype(np.float32),
-                )
-                msd = self.mean_surface_distance(
-                    walkable,
-                    previous_walkable
-                )
-
-                ious.append(iou)
-                dices.append(dice)
-                focal_losses.append(fl)
-                msds.append(msd)
-
             nav = self.analyze_navigation(walkable, hazard, dynamic)
+
+            if prev_walkable is not None:
+                iou = round(self.binary_iou(walkable, prev_walkable), 4)
+                dice = round(self.dice_score(walkable, prev_walkable), 4)
+                focal = round(self.focal_loss_binary(walkable.astype(np.float32), prev_walkable.astype(np.float32)), 6)
+                msd = round(self.mean_surface_distance(walkable, prev_walkable), 4)
+            else:
+                iou = dice = focal = msd = None
+
+            prev_walkable = walkable.copy()
 
             if out is not None:
                 viz = self.create_visualization(
@@ -651,44 +629,30 @@ class ImprovedSegmentation:
 
             nav_sidecar = frame_path.with_suffix(".navigation.json")
             nav_sidecar.write_text(json.dumps({
-                "walkable_status": nav["status"],
-                "direction": nav["direction"],
-                "zone_scores": {
-                    k: round(float(v), 2) for k, v in nav["scores"].items()
-                },
-                "walkable_pixel_ratio": round(
-                    float(np.sum(walkable)) / walkable.size, 4
-                ),
-                "hazard_pixel_ratio": round(
-                    float(np.sum(hazard)) / hazard.size, 4
-                ),
-                "dynamic_obstacle_ratio": round(
-                    float(np.sum(dynamic)) / dynamic.size, 4
-                ),
+                "segmentation": {
+                    "walkable_status": nav["status"],
+                    "direction":       nav["direction"],
+                    "zone_scores": {
+                        k: round(float(v), 2) for k, v in nav["scores"].items()
+                    },
+                    "walkable_pixel_ratio": round(float(np.sum(walkable)) / walkable.size, 4),
+                    "hazard_pixel_ratio":   round(float(np.sum(hazard))   / hazard.size,   4),
+                    "dynamic_obstacle_ratio": round(float(np.sum(dynamic)) / dynamic.size, 4),
+                    "iou": iou,
+                    "dice": dice,
+                    "focal_loss":  focal,
+                    "mean_surface_distance": msd,        
+                    "inference_latency_ms": infer_ms,
+                }
             }, indent=2))
 
             self.prev_walkable_mask = walkable
             self.prev_hazard_mask = hazard
-            previous_walkable = walkable.copy()
 
             processed_count += 1
 
         if out is not None:
             out.release()
-
-        metrics = self.calculate_group_metrics(
-            ious,
-            inference_times,
-            focal_losses,
-            dices,
-            msds,
-        )
-
-        self.save_group_json(
-            artifact_name,
-            group_name,
-            metrics
-        )
     
     # merge videos
 
