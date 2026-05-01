@@ -116,19 +116,6 @@ class ObjectDistanceEstimator:
             )
         return located
 
-    def pairwise_distances(self, located: Sequence[LocatedObject]) -> list[dict]:
-        out = []
-        for i in range(len(located)):
-            for j in range(i + 1, len(located)):
-                a, b = located[i], located[j]
-                d = float(np.linalg.norm(a.position_m - b.position_m))
-                out.append({
-                    "a": a.label or f"object_{i}",
-                    "b": b.label or f"object_{j}",
-                    "distance_m": round(d, 2),
-                })
-        return out
-
     def distances_from_camera(self, located: Sequence[LocatedObject]) -> list[dict]:
         return [
             {
