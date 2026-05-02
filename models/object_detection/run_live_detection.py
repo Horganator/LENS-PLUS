@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
+import torch
 from ultralytics import YOLO
 
 BASE_DIR     = Path(__file__).resolve().parent
@@ -61,10 +62,12 @@ class ObjectDetector:
         self.target_fps  = target_fps
         self.conf        = conf
         self.write_video = write_video
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.yolo_device = 0 if self.device == "cuda" else "cpu"
 
         print(f"Loading YOLO model: {model_path}")
         self.model = YOLO(model_path)
-        print("Model loaded.")
+        print(f"Model loaded. Object detection device: {self.device}")
 
     def find_latest_artifact(self) -> Path:
         artifacts = [p for p in self.frames_root.iterdir() if p.is_dir()]
@@ -140,7 +143,12 @@ class ObjectDetector:
                     frame = cv2.resize(frame, (OUTPUT_WIDTH, OUTPUT_HEIGHT))
 
                     t0 = time.perf_counter()
-                    results = self.model(frame, conf=self.conf, verbose=False)
+                    results = self.model(
+                        frame,
+                        conf=self.conf,
+                        verbose=False,
+                        device=self.yolo_device,
+                    )
                     latency_ms = (time.perf_counter() - t0) * 1000
 
                     detections = []
@@ -292,12 +300,21 @@ class ObjectDetector:
         last_new_group_time = time.time()
         demo_batch_num    = 1
         last_merged_count = 0
+        active_artifact: Path | None = None
 
         while True:
             try:
-                artifact = self.find_latest_artifact()
+                if active_artifact is None:
+                    active_artifact = self.find_latest_artifact()
+                    print(f"[Detection] Tracking session: {active_artifact.name}")
+                artifact = active_artifact
             except FileNotFoundError:
                 print("Waiting for a session to start...")
+                time.sleep(2)
+                continue
+
+            if not artifact.exists():
+                active_artifact = None
                 time.sleep(2)
                 continue
 
@@ -355,6 +372,28 @@ class ObjectDetector:
                     self.merge_n_groups(artifact.name, batch_keys, demo_batch_num)
                     last_merged_count += unmerged
                     demo_batch_num    += 1
+
+            # Stay on one artifact until it is fully processed.
+            pending = False
+            for group in groups:
+                key = f"{artifact.name}_{group.name}"
+                if key in processed_groups:
+                    continue
+                if self.load_frame_paths(group):
+                    pending = True
+                    break
+
+            if is_closed and not pending:
+                try:
+                    latest_artifact = self.find_latest_artifact()
+                except FileNotFoundError:
+                    latest_artifact = artifact
+                if latest_artifact != artifact:
+                    print(f"[Detection] Switching to new session: {latest_artifact.name}")
+                    active_artifact = latest_artifact
+                    processed_order = []
+                    last_merged_count = 0
+                    demo_batch_num = 1
 
             time.sleep(2)
 

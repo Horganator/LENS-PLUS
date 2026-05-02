@@ -559,12 +559,21 @@ class DepthEstimator:
         last_new_group_time = time.time()
         demo_batch_num = 1
         last_merged_count = 0
+        active_artifact: Path | None = None
 
         while True:
             try:
-                artifact = self.find_latest_artifact()
+                if active_artifact is None:
+                    active_artifact = self.find_latest_artifact()
+                    print(f"[Depth] Tracking session: {active_artifact.name}")
+                artifact = active_artifact
             except FileNotFoundError:
                 print("Waiting for a session to start...")
+                time.sleep(2)
+                continue
+
+            if not artifact.exists():
+                active_artifact = None
                 time.sleep(2)
                 continue
 
@@ -632,6 +641,27 @@ class DepthEstimator:
             idle = time.time() - last_new_group_time
             if idle > 10 and idle % 30 < 2: # print every 30s
                 print(f"  Waiting for new groups... ({idle:.0f}s idle)")
+
+            pending = False
+            for group in groups:
+                key = f"{artifact.name}_{group.name}"
+                if key in processed_groups:
+                    continue
+                if self.load_frame_paths(group):
+                    pending = True
+                    break
+
+            if is_closed and not pending:
+                try:
+                    latest_artifact = self.find_latest_artifact()
+                except FileNotFoundError:
+                    latest_artifact = artifact
+                if latest_artifact != artifact:
+                    print(f"[Depth] Switching to new session: {latest_artifact.name}")
+                    active_artifact = latest_artifact
+                    processed_order = []
+                    last_merged_count = 0
+                    demo_batch_num = 1
 
             time.sleep(2)
 

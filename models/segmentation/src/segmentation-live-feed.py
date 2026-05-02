@@ -114,6 +114,9 @@ class ImprovedSegmentation:
         self.target_fps = target_fps
         self.use_yolo = use_yolo
         self.deeplab_every_n_frames = deeplab_every_n_frames
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.yolo_device = 0 if self.device == "cuda" else "cpu"
+        print(f"Segmentation using device: {self.device}")
 
         self.mapper = CityscapesAccessibilityMapper()
 
@@ -304,7 +307,7 @@ class ImprovedSegmentation:
         else:
             model.load_state_dict(checkpoint)
 
-        model.eval()
+        model.to(self.device).eval()
         return model
 
 
@@ -334,7 +337,7 @@ class ImprovedSegmentation:
 
     def get_semantic_predictions(self, image):
         rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        tensor = self.transform(rgb).unsqueeze(0)
+        tensor = self.transform(rgb).unsqueeze(0).to(self.device)
 
         with torch.no_grad():
             outputs = self.deeplab_model(tensor)
@@ -627,6 +630,7 @@ class ImprovedSegmentation:
                             frame,
                             conf=0.5,
                             verbose=False,
+                            device=self.yolo_device,
                         )
                     else:
                         yolo_results = None
@@ -744,12 +748,20 @@ class ImprovedSegmentation:
         demo_batch_num = 1
         last_merged_count = 0
         known_groups = []
+        active_artifact: Path | None = None
 
         DEMO_BATCH_SIZE = 2
 
         while True:
             try:
-                artifact = self.find_latest_artifact()
+                if active_artifact is None:
+                    active_artifact = self.find_latest_artifact()
+                    print(f"[Segmentation] Tracking session: {active_artifact.name}")
+                artifact = active_artifact
+                if not artifact.exists():
+                    active_artifact = None
+                    time.sleep(0.5)
+                    continue
                 groups = self.get_group_folders(artifact)
 
                 group_names = [g.name for g in groups]
@@ -811,6 +823,27 @@ class ImprovedSegmentation:
                         self.merge_group_videos(artifact.name, batch_keys, demo_batch_num)
                         last_merged_count += unmerged_count
                         demo_batch_num += 1
+
+                pending = False
+                for group in groups:
+                    key = f"{artifact.name}_{group.name}"
+                    if key in processed_groups:
+                        continue
+                    if self.load_frame_paths(group):
+                        pending = True
+                        break
+
+                if is_closed and not pending:
+                    try:
+                        latest_artifact = self.find_latest_artifact()
+                    except FileNotFoundError:
+                        latest_artifact = artifact
+                    if latest_artifact != artifact:
+                        print(f"[Segmentation] Switching to new session: {latest_artifact.name}")
+                        active_artifact = latest_artifact
+                        processed_order = []
+                        last_merged_count = 0
+                        demo_batch_num = 1
 
             except FileNotFoundError:
                 print("No artifacts found")
