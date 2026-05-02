@@ -22,9 +22,9 @@ services:
     ports:
       - "5173:5173"
     environment:
-      - VITE_SIGNALING_BASE_URL=${VITE_SIGNALING_BASE_URL:-/api}
+      - VITE_SIGNALING_BASE_URL=/api
       - VITE_API_PROXY_TARGET=${VITE_API_PROXY_TARGET:-http://api:8000}
-      - DEV_HTTPS=${DEV_HTTPS:-false}
+      - DEV_HTTPS=true
       - DEV_HTTPS_KEY_FILE=${DEV_HTTPS_KEY_FILE:-/app/certs/dev-key.pem}
       - DEV_HTTPS_CERT_FILE=${DEV_HTTPS_CERT_FILE:-/app/certs/dev-cert.pem}
     volumes:

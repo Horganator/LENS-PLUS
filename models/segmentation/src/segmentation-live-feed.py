@@ -2,6 +2,7 @@ import os
 import sys
 import re
 import time
+import traceback
 from datetime import datetime
 from pathlib import Path
 import json
@@ -11,6 +12,13 @@ from time import perf_counter
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BASE_DIR.parents[2]
 DEEPLAB_PATH = BASE_DIR / "DeepLabV3Plus-Pytorch"
+DEEPLAB_NETWORK_PATH = DEEPLAB_PATH / "network"
+if not DEEPLAB_NETWORK_PATH.exists():
+    raise RuntimeError(
+        f"Missing DeepLab code at {DEEPLAB_NETWORK_PATH}. "
+        "Clone https://github.com/VainF/DeepLabV3Plus-Pytorch into "
+        f"{DEEPLAB_PATH}."
+    )
 sys.path.insert(0, str(DEEPLAB_PATH))
 
 import cv2
@@ -19,6 +27,12 @@ import torch
 from torchvision import transforms
 from ultralytics import YOLO
 import network
+if not hasattr(network, "modeling"):
+    raise RuntimeError(
+        "Imported 'network' module does not expose 'modeling'. "
+        f"Expected local module under {DEEPLAB_NETWORK_PATH}. "
+        "Check your PYTHONPATH and DeepLab checkout."
+    )
  
 APP_DIR = PROJECT_ROOT / "api" / "app"
 
@@ -530,6 +544,43 @@ class ImprovedSegmentation:
     def preprocess_frame(self, frame):
         frame = cv2.resize(frame, (FRAME_SIZE[0], FRAME_SIZE[1]))
         return frame
+
+    def write_segmentation_to_json(
+        self,
+        frame_path: Path,
+        nav: dict,
+        walkable: np.ndarray,
+        hazard: np.ndarray,
+        dynamic: np.ndarray,
+        iou: float | None,
+        dice: float | None,
+        focal: float | None,
+        msd: float | None,
+        infer_ms: float,
+    ):
+        sidecar = frame_path.with_suffix(".navigation.json")
+        try:
+            existing = json.loads(sidecar.read_text()) if sidecar.exists() else {}
+        except Exception:
+            existing = {}
+
+        existing["frame"] = frame_path.name
+        existing["timestamp"] = frame_path.stem.split("-")[-1]
+        existing["segmentation"] = {
+            "walkable_status": nav["status"],
+            "direction": nav["direction"],
+            "zone_scores": {k: round(float(v), 2) for k, v in nav["scores"].items()},
+            "walkable_pixel_ratio": round(float(np.sum(walkable)) / walkable.size, 4),
+            "hazard_pixel_ratio": round(float(np.sum(hazard)) / hazard.size, 4),
+            "dynamic_obstacle_ratio": round(float(np.sum(dynamic)) / dynamic.size, 4),
+            "iou": iou,
+            "dice": dice,
+            "focal_loss": focal,
+            "mean_surface_distance": msd,
+            "inference_latency_ms": infer_ms,
+        }
+
+        sidecar.write_text(json.dumps(existing, indent=2))
     
 
     def process_group(
@@ -561,98 +612,102 @@ class ImprovedSegmentation:
 
         prev_walkable = None
 
-        for frame_path in frame_paths:
+        try:
+            for frame_path in frame_paths:
+                try:
+                    frame = cv2.imread(str(frame_path))
 
-            frame = cv2.imread(str(frame_path))
+                    if frame is None:
+                        continue
 
-            if frame is None:
-                continue
+                    frame = self.preprocess_frame(frame)
 
-            frame = self.preprocess_frame(frame)
+                    if self.use_yolo:
+                        yolo_results = self.yolo_model(
+                            frame,
+                            conf=0.5,
+                            verbose=False,
+                        )
+                    else:
+                        yolo_results = None
 
-            if self.use_yolo:
-                yolo_results = self.yolo_model(
-                    frame,
-                    conf=0.5,
-                    verbose=False,
-                )
-            else:
-                yolo_results = None
+                    if processed_count % self.deeplab_every_n_frames == 0:
+                        t0 = perf_counter()
+                        semantic = self.get_semantic_predictions(frame)
+                        segmentation_cache = semantic
+                        infer_ms = round((perf_counter() - t0) * 1000, 2)
+                    else:
+                        semantic = segmentation_cache
+                        infer_ms = 0.0
 
-            if processed_count % self.deeplab_every_n_frames == 0:
-                t0 = perf_counter()
-                semantic = self.get_semantic_predictions(frame)
-                segmentation_cache = semantic
-                infer_ms = round((perf_counter() - t0) * 1000, 2)
-            else:
-                semantic = segmentation_cache
-                infer_ms = 0.0
+                    walkable = self.mapper.get_walkable_mask(semantic)
+                    hazard = self.mapper.get_hazard_mask(semantic)
+                    dynamic = self.mapper.get_dynamic_obstacle_mask(semantic)
+                    signs = self.mapper.get_traffic_sign_mask(semantic)
 
-            walkable = self.mapper.get_walkable_mask(semantic)
-            hazard = self.mapper.get_hazard_mask(semantic)
-            dynamic = self.mapper.get_dynamic_obstacle_mask(semantic)
-            signs = self.mapper.get_traffic_sign_mask(semantic)
+                    walkable = self.apply_temporal_smoothing(
+                        walkable,
+                        self.prev_walkable_mask,
+                    )
 
-            walkable = self.apply_temporal_smoothing(
-                walkable,
-                self.prev_walkable_mask,
-            )
+                    hazard = self.apply_temporal_smoothing(
+                        hazard,
+                        self.prev_hazard_mask,
+                    )
 
-            hazard = self.apply_temporal_smoothing(
-                hazard,
-                self.prev_hazard_mask,
-            )
+                    nav = self.analyze_navigation(walkable, hazard, dynamic)
 
-            nav = self.analyze_navigation(walkable, hazard, dynamic)
+                    if prev_walkable is not None:
+                        iou = round(self.binary_iou(walkable, prev_walkable), 4)
+                        dice = round(self.dice_score(walkable, prev_walkable), 4)
+                        focal = round(
+                            self.focal_loss_binary(
+                                walkable.astype(np.float32),
+                                prev_walkable.astype(np.float32),
+                            ),
+                            6,
+                        )
+                        msd = round(self.mean_surface_distance(walkable, prev_walkable), 4)
+                    else:
+                        iou = dice = focal = msd = None
 
-            if prev_walkable is not None:
-                iou = round(self.binary_iou(walkable, prev_walkable), 4)
-                dice = round(self.dice_score(walkable, prev_walkable), 4)
-                focal = round(self.focal_loss_binary(walkable.astype(np.float32), prev_walkable.astype(np.float32)), 6)
-                msd = round(self.mean_surface_distance(walkable, prev_walkable), 4)
-            else:
-                iou = dice = focal = msd = None
+                    prev_walkable = walkable.copy()
 
-            prev_walkable = walkable.copy()
+                    if out is not None:
+                        viz = self.create_visualization(
+                            frame,
+                            yolo_results,
+                            walkable,
+                            hazard,
+                            dynamic,
+                            signs,
+                            nav,
+                        )
+                        out.write(viz)
 
+                    self.write_segmentation_to_json(
+                        frame_path=frame_path,
+                        nav=nav,
+                        walkable=walkable,
+                        hazard=hazard,
+                        dynamic=dynamic,
+                        iou=iou,
+                        dice=dice,
+                        focal=focal,
+                        msd=msd,
+                        infer_ms=infer_ms,
+                    )
+
+                    self.prev_walkable_mask = walkable
+                    self.prev_hazard_mask = hazard
+
+                    processed_count += 1
+                except Exception as error:
+                    print(f"  [Segmentation] Frame failed: {frame_path.name} — {error}")
+                    continue
+        finally:
             if out is not None:
-                viz = self.create_visualization(
-                    frame,
-                    yolo_results,
-                    walkable,
-                    hazard,
-                    dynamic,
-                    signs,
-                    nav
-                )
-                out.write(viz)
-
-            nav_sidecar = frame_path.with_suffix(".navigation.json")
-            nav_sidecar.write_text(json.dumps({
-                "segmentation": {
-                    "walkable_status": nav["status"],
-                    "direction":       nav["direction"],
-                    "zone_scores": {
-                        k: round(float(v), 2) for k, v in nav["scores"].items()
-                    },
-                    "walkable_pixel_ratio": round(float(np.sum(walkable)) / walkable.size, 4),
-                    "hazard_pixel_ratio":   round(float(np.sum(hazard))   / hazard.size,   4),
-                    "dynamic_obstacle_ratio": round(float(np.sum(dynamic)) / dynamic.size, 4),
-                    "iou": iou,
-                    "dice": dice,
-                    "focal_loss":  focal,
-                    "mean_surface_distance": msd,        
-                    "inference_latency_ms": infer_ms,
-                }
-            }, indent=2))
-
-            self.prev_walkable_mask = walkable
-            self.prev_hazard_mask = hazard
-
-            processed_count += 1
-
-        if out is not None:
-            out.release()
+                out.release()
     
     # merge videos
 
@@ -690,7 +745,7 @@ class ImprovedSegmentation:
         last_merged_count = 0
         known_groups = []
 
-        DEMO_BATCH_SIZE = 3
+        DEMO_BATCH_SIZE = 2
 
         while True:
             try:
@@ -759,6 +814,9 @@ class ImprovedSegmentation:
 
             except FileNotFoundError:
                 print("No artifacts found")
+            except Exception as error:
+                print(f"[Segmentation] Loop error: {error}")
+                traceback.print_exc()
 
             time.sleep(0.5)
 

@@ -9,6 +9,13 @@ BASE_DIR = Path(__file__).resolve().parent
 OBJ_DETECTION_SCRIPT = BASE_DIR / "object_detection" / "run_live_detection.py"
 SEGMENTATION_SCRIPT = BASE_DIR / "segmentation" / "src" / "segmentation-live-feed.py"
 DEPTH_SCRIPT = BASE_DIR / "depth_estimation" / "depth_estimator.py"
+SUMMARY_SCRIPT = BASE_DIR / "metrics_summary" / "run_group_pair_summary.py"
+
+def launch_process(script_path: Path, extra_args: list[str] | None = None) -> subprocess.Popen:
+    args = [sys.executable, str(script_path)]
+    if extra_args:
+        args.extend(extra_args)
+    return subprocess.Popen(args, cwd=str(script_path.parent))
 
 def main():
     parser = argparse.ArgumentParser()
@@ -28,51 +35,39 @@ def main():
 
     print("Pipeline Starting...\n")
 
-    print(f"Starting Object Detection: {OBJ_DETECTION_SCRIPT.name}")
+    process_specs = {
+        "Object Detection": (OBJ_DETECTION_SCRIPT, extra_args),
+        "Segmentation": (SEGMENTATION_SCRIPT, extra_args),
+        "Depth Estimation": (DEPTH_SCRIPT, extra_args),
+        "Metrics Summary": (SUMMARY_SCRIPT, []),
+    }
 
-    obj_det_process = subprocess.Popen(
-        [sys.executable, str(OBJ_DETECTION_SCRIPT)] + extra_args,
-        cwd=str(OBJ_DETECTION_SCRIPT.parent),
-    )
-
-    time.sleep(2)
-
-    print(f"Starting Segmentation: {SEGMENTATION_SCRIPT.name}")
-
-    seg_process = subprocess.Popen(
-        [sys.executable, str(SEGMENTATION_SCRIPT)] + extra_args,
-        cwd=str(SEGMENTATION_SCRIPT.parent),
-    )
-
-    time.sleep(2)
-    print(f"Starting Depth Estimation: {DEPTH_SCRIPT.name}")
-
-    depth_process = subprocess.Popen(
-        [sys.executable, str(DEPTH_SCRIPT)] + extra_args,
-        cwd=str(DEPTH_SCRIPT.parent),
-    )
+    processes: dict[str, subprocess.Popen] = {}
+    for name, (script_path, script_args) in process_specs.items():
+        print(f"Starting {name}: {script_path.name}")
+        processes[name] = launch_process(script_path, script_args)
+        time.sleep(2)
 
     print("\nPipeline is live. Press Ctrl+C to stop.\n")
 
     try:
         while True:
             time.sleep(1)
-            if obj_det_process.poll() is not None:
-                print("WARN: Object Detection script stopped unexpectedly!")
-            if seg_process.poll() is not None:
-                print("WARN: Segmentation script stopped unexpectedly!")
-            if depth_process.poll() is not None:
-                print("WARN: Depth script stopped unexpectedly!")
+            for name, process in list(processes.items()):
+                if process.poll() is None:
+                    continue
+                code = process.returncode
+                print(f"WARN: {name} stopped unexpectedly (exit {code}). Restarting...")
+                script_path, script_args = process_specs[name]
+                processes[name] = launch_process(script_path, script_args)
                 
     except KeyboardInterrupt:
         print("Shutting down pipeline...")
-        obj_det_process.terminate()
-        seg_process.terminate()
-        depth_process.terminate()
-        
-        obj_det_process.wait()
-        seg_process.wait()
-        depth_process.wait()
+        for process in processes.values():
+            process.terminate()
+
+        for process in processes.values():
+            process.wait()
         print("Shutdown complete.")
 
 if __name__ == "__main__":

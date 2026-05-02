@@ -34,7 +34,7 @@ OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 OUTPUT_WIDTH = 640
 OUTPUT_HEIGHT = 360
 
-DEMO_BATCH_SIZE = 3 # merge groups of frames every n groups
+DEMO_BATCH_SIZE = 2 # merge groups of frames every n groups
 
 def read_and_resize(path: Path) -> np.ndarray | None:
     frame = cv2.imread(str(path))
@@ -445,75 +445,80 @@ class DepthEstimator:
         prev_zone_nearest = None
         total_frames = 0
 
-        for idx, (frame_path, frame) in enumerate(zip(frame_paths, frames)):
-            if frame is None:
-                continue
+        try:
+            for idx, (frame_path, frame) in enumerate(zip(frame_paths, frames)):
+                try:
+                    if frame is None:
+                        continue
 
-            frame = cv2.resize(frame, (OUTPUT_WIDTH, OUTPUT_HEIGHT))
+                    frame = cv2.resize(frame, (OUTPUT_WIDTH, OUTPUT_HEIGHT))
 
-            t0 = time.perf_counter()
-            depth = self.get_depth_predictions(frame)
-            latency_ms = (time.perf_counter() - t0) * 1000
+                    t0 = time.perf_counter()
+                    depth = self.get_depth_predictions(frame)
+                    latency_ms = (time.perf_counter() - t0) * 1000
 
-            depth = self.apply_temporal_smoothing(depth, self.prev_depth)
-            analysis = self.analyser.analyse_zones(depth)
-            consistency = self.compute_temporal_consistency(depth, self.prev_depth)
+                    depth = self.apply_temporal_smoothing(depth, self.prev_depth)
+                    analysis = self.analyser.analyse_zones(depth)
+                    consistency = self.compute_temporal_consistency(depth, self.prev_depth)
 
-            variance = self.depth_variance(depth)
-            edge_density = self.depth_edge_density(depth)
-            valid_ratio = self.valid_pixel_ratio(depth)
-            bboxes = self.load_detections_for_frame(frame_path)
-            located = self.distance_estimator.locate(depth, bboxes)
-            per_object = self.distance_estimator.distances_from_camera(located)
-            status_changed = (
-                prev_status is not None and
-                analysis["proximity_status"] != prev_status
-            )
-            zone_stability = (
-                round(float(np.mean([
-                    abs(analysis["zone_nearest_m"][k] - prev_zone_nearest[k])
-                    for k in ["left", "centre", "right", "floor"]
-                ])), 4)
-                if prev_zone_nearest is not None else 0.0
-            )
+                    variance = self.depth_variance(depth)
+                    edge_density = self.depth_edge_density(depth)
+                    valid_ratio = self.valid_pixel_ratio(depth)
+                    bboxes = self.load_detections_for_frame(frame_path)
+                    located = self.distance_estimator.locate(depth, bboxes)
+                    per_object = self.distance_estimator.distances_from_camera(located)
+                    status_changed = (
+                        prev_status is not None and
+                        analysis["proximity_status"] != prev_status
+                    )
+                    zone_stability = (
+                        round(float(np.mean([
+                            abs(analysis["zone_nearest_m"][k] - prev_zone_nearest[k])
+                            for k in ["left", "centre", "right", "floor"]
+                        ])), 4)
+                        if prev_zone_nearest is not None else 0.0
+                    )
 
+                    if out is not None:
+                        viz = self.create_visualisation(frame, depth, analysis, idx, located)
+                        viz = cv2.resize(viz, (OUTPUT_WIDTH, OUTPUT_HEIGHT))
+                        out.write(viz)
+
+                    self.write_depth_to_json(
+                        frame_path=frame_path,
+                        analysis=analysis,
+                        per_object=per_object,
+                        consistency=consistency,
+                        variance=variance,
+                        edge_density=edge_density,
+                        valid_ratio=valid_ratio,
+                        status_changed=status_changed,
+                        zone_stability=zone_stability,
+                        latency_ms=latency_ms,
+                    )
+
+                    self.prev_depth = depth
+                    prev_status = analysis["proximity_status"]
+                    prev_zone_nearest = analysis["zone_nearest_m"].copy()
+                    total_frames += 1
+
+                    distance_summary = ""
+                    if per_object:
+                        nearest = min(per_object, key=lambda o: o["distance_m"])
+                        distance_summary = (
+                            f" - {nearest['label']} @ {nearest['distance_m']}m"
+                        )
+
+                    print(
+                        f"  [{frame_path.name}] {analysis['proximity_status']} - "
+                        f"{analysis['proximity_detail']}{distance_summary}  ({latency_ms:.0f}ms)"
+                    )
+                except Exception as error:
+                    print(f"  [Depth] Frame failed: {frame_path.name} - {error}")
+                    continue
+        finally:
             if out is not None:
-                viz = self.create_visualisation(frame, depth, analysis, idx, located)
-                viz = cv2.resize(viz, (OUTPUT_WIDTH, OUTPUT_HEIGHT))
-                out.write(viz)
-
-            self.write_depth_to_json(
-                frame_path=frame_path,
-                analysis=analysis,
-                per_object=per_object,
-                consistency=consistency,
-                variance=variance,
-                edge_density=edge_density,
-                valid_ratio=valid_ratio,
-                status_changed=status_changed,
-                zone_stability=zone_stability,
-                latency_ms=latency_ms,
-            )
-
-            self.prev_depth = depth
-            prev_status = analysis["proximity_status"]
-            prev_zone_nearest = analysis["zone_nearest_m"].copy()
-            total_frames += 1
-
-            distance_summary = ""
-            if per_object:
-                nearest = min(per_object, key=lambda o: o["distance_m"])
-                distance_summary = (
-                    f" — {nearest['label']} @ {nearest['distance_m']}m"
-                )
-
-            print(
-                f"  [{frame_path.name}] {analysis['proximity_status']} — "
-                f"{analysis['proximity_detail']}{distance_summary}  ({latency_ms:.0f}ms)"
-            )
-
-        if out is not None:
-            out.release()
+                out.release()
 
         return {
             "total_frames": total_frames,
@@ -652,3 +657,4 @@ if __name__ == "__main__":
         write_video=not args.no_video,
     )
     model.run()
+
